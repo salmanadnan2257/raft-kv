@@ -1,0 +1,23 @@
+$ pytest -m "not slow"
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/rolex/Salman Adnan/Programming/Portfolio/raft-kv
+configfile: pyproject.toml
+testpaths: tests
+collected 57 items / 1 deselected / 56 selected
+
+tests/test_election.py .....                                             [  8%]
+tests/test_kv_sessions.py ....                                           [ 16%]
+tests/test_linearizability.py ...........                                [ 35%]
+tests/test_membership.py .....                                           [ 44%]
+tests/test_persistence.py .......                                        [ 57%]
+tests/test_readindex.py ....                                             [ 64%]
+tests/test_replication.py .........                                      [ 80%]
+tests/test_sim_invariants.py .....                                       [ 89%]
+tests/test_snapshot.py ...                                               [ 94%]
+tests/test_tcp_integration.py ...                                        [100%]
+
+======================= 56 passed, 1 deselected in 8.11s =======================
+
+$ raftkv sim --seeds 150 --workers 8
+150 seeds in 4.5s (33.1 seeds/s), 16604 client ops total, 0 failure(s)
