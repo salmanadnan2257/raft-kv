@@ -243,6 +243,7 @@ On this machine (Linux, Python 3.12.3):
   (time, seq) heap, and partitions filter at delivery time. A test runs
   the same seed twice and compares full history fingerprints, which
   caught two accidental uses of ambient ordering during development.
+- **Writing the exhaustive project documentation honestly.** The first attempt at generating the explainer PDFs stalled mid-task and had to be redone. Diagramming a distributed system honestly (the Raft state machine, the chaos-test harness) meant several rounds of fixing real tikz overflow and label-clipping bugs, not just describing the system in prose.
 
 ## What I learned
 
