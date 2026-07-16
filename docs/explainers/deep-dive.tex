@@ -1,5 +1,5 @@
 % explainer-source-hash: b61f9ba78915fdf5b2011a630b8496641f14462f328b2f9ba5f40a7d1eb57aaa
-% explainer-source-commit: ba9e27a6dfd9aac2ec9eea0d934bf2b9e5a3e06d
+% explainer-source-commit: 4302e8d356b88b447a7e8b3cbbfab75e1d7e0dc8
 % explainer-generated: 2026-07-16
 % Regenerate with /explain-all (see WIRING.md). Do not edit this stamp by hand:
 % it is how the toolchain knows whether this document still matches the code.
@@ -647,9 +647,9 @@ automatically, with no data transfer during the election itself.
   {the leader has died: no heartbeats reach anyone};
 
 % n1 times out first
-\node[lbl, anchor=east, align=right, text=warnred] at (-0.3,6.0) {election timeout fires\\(randomized: n1 first)};
+\node[lbl, anchor=east, align=right, text=warnred] at (-0.7,6.0) {election timeout fires\\(randomized: n1 first)};
 \filldraw[warnred] (0,6.0) circle (2.5pt);
-\node[lbl, anchor=east, align=right] at (-0.4,5.2) {term 1 $\rightarrow$ 2\\votedFor = n1\\\textbf{fsync before replying}};
+\node[lbl, anchor=east, align=right] at (-0.7,5.2) {term 1 $\rightarrow$ 2\\votedFor = n1\\\textbf{fsync before replying}};
 
 \draw[flow] (0,4.5) -- node[lbl, above, pos=0.5]{RequestVote(term=2, lastIdx=5, lastTerm=1)} (4.6,4.5);
 \draw[flow] (0,4.5) -- (9.2,4.5);
@@ -658,11 +658,11 @@ automatically, with no data transfer during the election itself.
 \node[lbl, anchor=north west, align=left] at (9.35,4.2) {same: \textbf{grant}};
 
 \draw[flow] (4.6,2.9) -- node[lbl, above, pos=0.5]{VoteGranted} (0,2.9);
-\node[lbl, anchor=east, align=right, text=okgreen] at (-0.3,2.4) {votes = \{n1, n2\}\\2 $\geq$ majority(3) = 2\\\textbf{LEADER}};
+\node[lbl, anchor=east, align=right, text=okgreen] at (-0.7,2.4) {votes = \{n1, n2\}\\2 $\geq$ majority(3) = 2\\\textbf{LEADER}};
 \filldraw[okgreen] (0,2.9) circle (2.5pt);
 \draw[flow] (9.2,2.2) -- node[lbl, below, pos=0.42]{VoteGranted (arrives late, already won: ignored)} (0,1.9);
 
-\node[lbl, anchor=east, align=right] at (-0.4,1.3) {append no-op\\at index 6, term 2};
+\node[lbl, anchor=east, align=right] at (-0.7,1.3) {append no-op\\at index 6, term 2};
 
 \draw[flow] (0,0.7) -- node[lbl, above, pos=0.5]{AppendEntries(term=2, entries=[6:noop])} (4.6,0.7);
 \draw[flow] (0,0.7) -- (9.2,0.7);
@@ -773,9 +773,9 @@ at all, and why the follower's reply is trustworthy.
 \node[lbl, anchor=north west, align=left, text width=4.6cm] at (6.5,6.1)
   {my term at index 5 is 2:\\\textbf{matches}. Append entry 6,\\\textbf{fsync}};
 
-\draw[flow] (0,5.3) -- node[lbl, below, pos=0.5]{AppendEntries(\dots)} (9.15,5.3);
-\node[font=\Large, text=warnred] at (9.4,5.3) {$\times$};
-\node[lbl, anchor=north, align=center, text width=3.4cm, text=warnred] at (9.4,5.0)
+\draw[flow] (0,4.7) -- node[lbl, above, pos=0.5]{AppendEntries(\dots), the same entry to n3} (9.15,4.7);
+\node[font=\Large, text=warnred] at (9.4,4.7) {$\times$};
+\node[lbl, anchor=north, align=center, text width=3.4cm, text=warnred] at (9.4,4.4)
   {this message is lost\\by the network};
 
 \draw[flow] (6.2,3.4) -- node[lbl, above, pos=0.5]{Reply(success=true, matchIndex=6)} (0,3.4);
