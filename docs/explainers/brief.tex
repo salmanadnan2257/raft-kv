@@ -1,0 +1,631 @@
+% explainer-source-hash: b61f9ba78915fdf5b2011a630b8496641f14462f328b2f9ba5f40a7d1eb57aaa
+% explainer-source-commit: ba9e27a6dfd9aac2ec9eea0d934bf2b9e5a3e06d
+% explainer-generated: 2026-07-16
+% Regenerate with /explain-all (see WIRING.md). Do not edit this stamp by hand:
+% it is how the toolchain knows whether this document still matches the code.
+\documentclass[11pt,a4paper]{article}
+\input{preamble}
+
+\title{\vspace{-1.5cm}\textbf{raft-kv}\\[0.3cm]
+\large A Distributed Key-Value Store with Raft Consensus,\\
+Deterministic Simulation, and a Linearizability Checker\\[0.4cm]
+\normalsize Brief: the argument, the architecture, and the evidence}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+% =====================================================================
+\section{The one-paragraph version}
+
+\begin{keyidea}{What this is}
+A key-value database that keeps identical copies of its data on several
+machines, so that any one of them can die without losing data or serving a
+wrong answer. Keeping machines in exact agreement while they crash and their
+network breaks is the problem called \textbf{consensus}, and this project
+solves it with the \textbf{Raft} algorithm, written from scratch in Python with
+no consensus libraries and zero runtime dependencies. But the consensus code is
+the smaller half of the project. The larger half is the evidence: a
+\textbf{deterministic simulator} that replays thousands of randomized disasters
+against the real consensus code as a pure function of a single integer, and a
+from-scratch \textbf{linearizability checker} that verifies the answers clients
+actually received could have come from a single, honest, non-distributed
+database.
+\end{keyidea}
+
+\subsection{The thesis}
+
+The project exists to make an argument, and the argument is the interesting part:
+
+\begin{quote}
+\itshape Consensus code is easy to write and nearly impossible to trust from
+example-based tests, because the bugs live in message interleavings you will
+never hit on a laptop loopback. So the system should be testable as a
+deterministic function of a seed.
+\end{quote}
+
+This is the position taken by the FoundationDB database, and it drives every
+structural decision here. If every source of nondeterminism (time, message
+delay, loss, duplication, partition timing, crash timing, client behaviour,
+election jitter) is drawn from one seeded generator, then a whole 12-second
+cluster lifetime under sustained chaos becomes a \textbf{pure function of one
+integer}. That buys three things at once:
+
+\begin{itemize}
+\item thousands of universes run in seconds, because no real time passes;
+\item a failure report is one integer, not a flaky-test shrug;
+\item the failing schedule replays exactly, forever, under a debugger.
+\end{itemize}
+
+The whole architecture is bent around one precondition for this to be worth
+anything: \textbf{the simulated system must be the real system}. A simulator
+that tests a copy of the consensus logic tests nothing.
+
+% =====================================================================
+\section{Three ideas you need, from first principles}
+
+\begin{jargon}{Consensus}
+Getting a group of unreliable machines to agree on one \textbf{ordered list of
+decisions}, such that once a decision is made it is permanent, and no two
+machines ever disagree about what decision number 7 was. Crucially, the group
+does not agree on ``the value of key \code{city}''. It agrees on an ordered log
+of commands. If every machine holds the same log and runs the same
+deterministic program over it, every machine ends up with identical data,
+necessarily. Agreement on the data is derived free from agreement on the order.
+This is called a \textbf{replicated state machine}.
+\end{jargon}
+
+\begin{jargon}{Quorum, and why it makes split brain impossible}
+Every important decision requires a strict majority of the cluster. The reason
+this works is a fact about sets, not computers: \textbf{any two majorities of
+the same set must share a member}, because 2 + 2 > 3. So a network partition
+can leave at most \emph{one} side with a majority; the other side is
+mathematically unable to act. Without this, two halves of a split cluster would
+each keep accepting writes and diverge permanently, which is called
+\textbf{split brain}. In this code the rule is one line:
+\code{len(self.config) // 2 + 1}.
+\end{jargon}
+
+\begin{jargon}{Linearizability}
+The correctness target, and the strongest single-object guarantee. A system is
+linearizable if every operation appears to take effect
+\textbf{instantaneously at some single moment between the client sending the
+request and receiving the response}, consistent with real time. The practical
+meaning: if your write finished at 10:00:01, every read starting at 10:00:02,
+on any node, must see it. The distributed system becomes indistinguishable from
+a single-threaded program holding one copy of the data. It is a property of the
+\emph{observable history}, not of the implementation, which is exactly why it
+can be checked from the outside without trusting the code.
+\end{jargon}
+
+% =====================================================================
+\section{The architecture, and the decision it turns on}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.99\textwidth}{!}{
+\begin{tikzpicture}[node distance=9mm]
+\node[draw=inkblue, very thick, fill=softgrey, rounded corners=4pt,
+      minimum width=50mm, minimum height=26mm] (core) {};
+\node[font=\small\bfseries, text=inkblue, anchor=north] at ($(core.north)+(0,-2mm)$)
+      {raft/ : the sans-IO core};
+\node[box, minimum width=40mm] (rn) at ($(core.center)+(0,1mm)$) {RaftNode};
+\node[lbl, anchor=south, align=center] at ($(core.south)+(0,2mm)$)
+      {\itshape no asyncio, no time,\\\itshape no socket, no global random};
+
+\node[dec, left=16mm of core, minimum width=17mm] (env) {Env};
+\node[dec, right=16mm of core, minimum width=17mm] (sto) {Storage};
+\draw[flow] (rn) -- node[lbl, above]{now, call\_later,\\send, rng} (env);
+\draw[flow] (rn) -- node[lbl, above]{load, append,\\snapshot} (sto);
+
+\node[extbox, above=13mm of env, minimum width=40mm] (aenv)
+  {AsyncioEnv + TcpTransport\\\scriptsize{}real clock, real sockets};
+\node[extbox, below=13mm of env, minimum width=40mm] (senv)
+  {SimEnv + SimNetwork + SimClock\\\scriptsize{}virtual time, seeded chaos};
+\node[extbox, above=13mm of sto, minimum width=40mm] (fs)
+  {FileStorage\\\scriptsize{}fsync, CRC, atomic rename};
+\node[extbox, below=13mm of sto, minimum width=40mm] (ms)
+  {MemoryStorage\\\scriptsize{}a perfect disk};
+
+\draw[dflow] (aenv) -- (env); \draw[dflow] (senv) -- (env);
+\draw[dflow] (fs) -- (sto);   \draw[dflow] (ms) -- (sto);
+
+\node[lbl, text=okgreen, anchor=west, align=left] at ($(aenv.east)+(4mm,0)$)
+  {\textbf{PRODUCTION}};
+\node[lbl, text=accent, anchor=west, align=left] at ($(senv.east)+(4mm,0)$)
+  {\textbf{SIMULATION}};
+\node[store, minimum width=24mm, below=13mm of core] (kv) {KVMachine\\\scriptsize{}get/put/delete/cas\\\scriptsize{}+ session table};
+\draw[flow] (rn) -- node[lbl, right]{apply(entry)} (kv);
+\end{tikzpicture}}
+\caption{The whole system in one picture. \code{RaftNode} can touch the world
+only through two narrow protocols. Swap what is plugged into them and the
+identical consensus code runs over real TCP or inside the simulator.}
+\end{figure}
+
+\begin{keyidea}{Sans-IO is the whole ballgame}
+\textbf{Sans-IO} (``without IO'') means the protocol implementation performs no
+input or output itself: it never opens a socket, never reads a clock, never
+sleeps. \code{RaftNode} reacts to exactly three stimuli (a message arrived, a
+timer fired, the local application asked for something) and emits effects
+through exactly two protocols, \code{Env} (\code{now}, \code{call\_later},
+\code{send}, \code{rng}) and \code{Storage}.
+
+The payoff is the entire project. Because the node takes its randomness from
+\code{env.rng} rather than the global \code{random} module, and its time from
+\code{env.now()} rather than \code{time.time()}, the simulator can hand it a
+seeded generator and a virtual clock and it cannot tell. So ``run 5000 chaos
+schedules in a few minutes'' becomes an ordinary function call, and
+\textbf{every bug the simulator finds is a production bug}, because it is
+literally the production code. There is no test double of the algorithm
+anywhere in this repository, and \file{raft/} contains no \code{if testing:}
+branch.
+\end{keyidea}
+
+The module layout follows directly, with the dependency arrow pointing inward:
+
+\begin{center}
+\begin{tabular}{lp{9.3cm}}
+\toprule
+\textbf{Module} & \textbf{Role} \\
+\midrule
+\file{raft/} & the consensus core: \code{RaftNode} (576 lines), the log, storage, messages, and the \code{Env} protocol. Imports nothing outward. \\
+\file{kv/} & the replicated state machine: get, put, delete, cas, plus the session table \\
+\file{transport/} & real asyncio TCP, length-prefixed JSON frames, and \code{AsyncioEnv} \\
+\file{sim/} & virtual clock, seeded chaos network, the harness, the batch runner \\
+\file{checker/} & history recording and the linearizability search \\
+\file{server.py}, \file{client.py}, \file{cli/} & one TCP node, a retrying client, the \code{raftkv} command \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =====================================================================
+\section{Raft, in one page}
+
+Every node is a follower, a candidate, or a leader. Time is divided into
+\textbf{terms}, an ever-increasing logical clock; at most one leader exists per
+term, and any message carrying a higher term instantly demotes its receiver to
+follower.
+
+\begin{figure}[H]
+\centering
+\resizebox{0.96\textwidth}{!}{
+\begin{tikzpicture}
+\node[box, minimum width=28mm, minimum height=12mm] (f) {\textbf{FOLLOWER}};
+\node[box, minimum width=28mm, minimum height=12mm, right=48mm of f] (c) {\textbf{CANDIDATE}};
+\node[box, minimum width=28mm, minimum height=12mm, right=48mm of c] (l) {\textbf{LEADER}};
+
+\draw[flow] (f) -- node[lbl, above, align=center]
+  {\textbf{election timeout}\\no heartbeat for a random\\time in [T, 2T]} (c);
+\draw[flow] (c) -- node[lbl, above, align=center]
+  {\textbf{votes from a majority}\\$\Rightarrow$ append a no-op entry,\\start heartbeats} (l);
+\draw[flow] (c) to[out=205, in=335] node[lbl, below, align=center]
+  {discovers a current leader,\\or sees a higher term} (f);
+\draw[flow] (l) to[out=250, in=290, looseness=0.6] node[lbl, below, align=center]
+  {\textbf{sees a higher term}, or is removed from the config\\
+   $\Rightarrow$ step down: cancel heartbeats, fail all pending reads and writes} (f);
+\draw[flow] (c) to[out=70, in=110, looseness=5] node[lbl, above, align=center]
+  {split vote: nobody won\\$\Rightarrow$ new term, campaign again} (c);
+\end{tikzpicture}}
+\caption{The role state machine. Note the asymmetry: there is no
+follower-to-leader edge and no leader-to-candidate edge. Power is only taken
+through an election and only surrendered by stepping down.}
+\end{figure}
+
+\textbf{Election.} Followers wait a \emph{randomized} time (uniform in
+\code{[T, 2T]}) without hearing a heartbeat, then increment the term, vote for
+themselves, and ask for votes. Randomization is what prevents everyone from
+campaigning at once and splitting the vote forever. Two rules carry the weight:
+the vote is \textbf{persisted with fsync before the reply is sent} (a node that
+forgot its vote after a crash could vote twice in one term, producing two
+leaders), and voters \textbf{refuse any candidate whose log is less up to date
+than their own}. That second rule is what makes committed data survive every
+leader change automatically: a winner needs a majority, any majority overlaps
+the majority holding a committed entry, and those voters will refuse anyone
+missing it.
+
+\textbf{Replication.} The leader appends a command to its own log, fsyncs it,
+and broadcasts an \code{AppendEntries} message. That message carries the index
+and term of the entry \emph{immediately before} the new ones. If a follower
+disagrees there, it rejects and returns a \textbf{conflict hint}, the first
+index of the conflicting term, so the leader can back up in one jump rather
+than one entry per round trip. Agreement on that one preceding entry proves agreement on the
+entire prefix, by induction over the fact that indexes are never reused and one
+leader exists per term. Once a majority stores an entry, it is
+\textbf{committed}: permanent, present in every future leader's log.
+
+\begin{keyidea}{The subtlest rule in Raft, and the reason for the no-op}
+A leader may \textbf{not} commit an entry from an earlier term merely because it
+is now replicated on a majority. If it did, a different node whose log is more
+up to date on other grounds could still win a later election, not have that
+entry, and overwrite it: an entry reported committed would vanish. So the code
+checks \code{self.log.term\_at(candidate) == self.current\_term} before
+advancing the commit index (the paper's section 5.4.2). To make progress on the
+inherited backlog anyway, a fresh leader immediately appends a \code{noop}
+entry of its own term; when that commits by the ordinary majority rule,
+everything before it commits transitively and safely. The no-op is not a
+nicety: without it a leader receiving no writes could never commit its
+predecessor's backlog at all.
+\end{keyidea}
+
+\textbf{Crash safety} falls out of one discipline: never acknowledge before
+\code{fsync}, and make every on-disk structure either atomic-rename recoverable
+or scan-and-truncate recoverable. \code{hardstate.json} (term and vote) is
+written temp-file, fsync, rename, then \textbf{the directory is fsynced too},
+which is the step most implementations forget. \code{log.bin} is append-only
+records of \code{[4-byte length][4-byte CRC32][JSON]}; on recovery the file is
+scanned and the first short or bad-CRC record marks a torn tail from a crash
+mid-write, which is truncated away. Discarding data is provably safe here
+precisely because nothing is acknowledged before fsync returns, so a
+half-written record was never promised to anyone.
+
+\textbf{Snapshots} replace an applied prefix of the log with an image of the
+state machine (KV data \emph{and} the session table), sent to hopelessly lagging
+followers via \code{InstallSnapshot}. \textbf{Membership changes} use the
+dissertation's single-server approach: add or remove exactly one node per config
+entry, so any two configurations share a common majority and disjoint quorums
+cannot form, which is why no two-phase joint-consensus protocol is needed.
+
+% =====================================================================
+\section{Linearizable reads: ReadIndex}
+
+\begin{keyidea}{A leader cannot know that it is still the leader}
+This is the trap that makes reads harder than writes. Suppose n1 is partitioned
+away from n2 and n3, which elect a new leader and accept writes. n1 has heard
+nothing, so it still believes it leads, and its local data looks perfectly fine
+\emph{to it}. It will happily serve a value that is minutes stale. Nothing in
+its own state betrays it. Leadership is not a local fact, so reading from local
+memory is unsafe.
+\end{keyidea}
+
+The fix is \textbf{ReadIndex}: before answering a read, the leader must
+\emph{prove} its currency. It records \code{readIndex = commitIndex}, broadcasts
+a heartbeat round carrying a sequence number, and waits for acks from a majority
+for that round; only then does it read local state. A deposed leader in a
+minority partition is not merely unlikely to answer, it is \textbf{structurally
+unable} to, because those acks cannot cross the partition. When it eventually
+sees the higher term it steps down, and stepping down explicitly fails every
+pending read, so the client is told \code{not\_leader} and retries elsewhere.
+
+There is a second precondition, and the README credits the chaos harness with
+finding it: a fresh leader must first commit an entry \textbf{of its own term}
+before serving reads, because its \code{commit\_index} is a stale local variable
+that may be lower than what is actually committed cluster-wide. Reads arriving
+too early are parked with no read index and assigned one the instant the
+leader's no-op commits.
+
+\begin{keyidea}{The alternative that was refused, and why the reason matters}
+\emph{Leader leases} let a leader serve reads for
+\code{election\_timeout - clock\_drift} after one heartbeat quorum, saving a
+round trip per read. This project refuses them, and documents the refusal:
+leases buy latency at the price of a safety argument that depends on
+\textbf{bounded clock drift between physical machines}. In a project whose
+entire thesis is testable correctness, importing an untestable assumption about
+hardware clocks is a bad trade. ReadIndex costs one heartbeat round and assumes
+nothing about clocks.
+\end{keyidea}
+
+% =====================================================================
+\section{Exactly-once writes}
+
+\begin{keyidea}{Why retries corrupt data, and why the fix must live in the replicated state}
+A client sends a cas. The leader commits it, then dies before replying. The
+client times out and retries against the new leader, which has no idea this is
+a retry and applies it again. For a cas the retry now \emph{fails} (the value
+already changed), so the client is told its operation failed when in fact it
+succeeded. The fix: every write carries \code{(client\_id, seq)}, and the state
+machine remembers per client the last seq applied and \textbf{the result it
+returned}; a duplicate returns the cached result without re-executing.
+
+The part that is easy to get wrong is where the table lives. It must be
+\textbf{inside the replicated state}, going through the log and riding inside
+snapshots. A leader-local cache would silently downgrade the system from
+exactly-once to at-least-once precisely at failover, which is exactly when it
+matters. Exactly-once is a state machine feature, not a networking feature.
+\end{keyidea}
+
+% =====================================================================
+\section{The evidence machine}
+
+\subsection{One seeded run}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.99\textwidth}{!}{
+\begin{tikzpicture}[node distance=8mm]
+\node[box, minimum width=22mm] (seed) {\textbf{seed}};
+\node[dec, right=11mm of seed, minimum width=15mm] (root) {root\\Random};
+\draw[flow] (seed) -- (root);
+\node[extbox, right=12mm of root, minimum width=27mm, yshift=13mm] (r1) {network rng};
+\node[extbox, right=12mm of root, minimum width=27mm, yshift=0mm] (r2) {per-node rngs};
+\node[extbox, right=12mm of root, minimum width=27mm, yshift=-13mm] (r3) {nemesis + client rngs};
+\draw[dflow] (root) -- (r1); \draw[dflow] (root) -- (r2); \draw[dflow] (root) -- (r3);
+
+\node[box, minimum width=28mm, minimum height=26mm, right=12mm of r2] (heap)
+  {\textbf{SimClock}\\one heap ordered\\by (time, seq)};
+\draw[flow] (r1) -- (heap); \draw[flow] (r2) -- (heap); \draw[flow] (r3) -- (heap);
+
+\node[box, minimum width=26mm, right=12mm of heap, yshift=9mm] (nodes) {3 x RaftNode\\\scriptsize{}the real thing};
+\node[box, minimum width=26mm, right=12mm of heap, yshift=-9mm] (mon) {Monitor\\\scriptsize{}4 live invariants};
+\draw[flow] (heap) -- (nodes);
+\draw[flow] (nodes) -- node[lbl, right]{trace} (mon);
+\node[box, minimum width=26mm, right=13mm of nodes] (chk) {linearizability\\checker};
+\draw[flow] (nodes) -- node[lbl, above]{history} (chk);
+\node[box, minimum width=22mm, right=11mm of mon] (out) {PASS / FAIL\\\scriptsize{}named by seed};
+\draw[flow] (mon) -- (out);
+\draw[flow] (chk) to[out=0, in=90] (out);
+\end{tikzpicture}}
+\caption{Everything derives from the seed; everything funnels through one
+ordered event heap; two independent oracles judge the result. The tie-break on
+a sequence number inside that heap is load-bearing: without it, two events at
+the same virtual instant would run in an undefined order and determinism would
+die.}
+\end{figure}
+
+Each seed runs 12 virtual seconds of a 3-node cluster with 3 concurrent clients
+on 3 keys, under 5\% message loss, 5\% duplication, randomized delay, and a
+nemesis firing at Poisson intervals: random bisecting partitions, crash with
+delayed restart, election-timer clock skew (0.5x to 1.8x), and heals. Because
+time is a variable rather than something you wait for, those 12 virtual seconds
+cost roughly 0.1 real seconds. There is no \code{sleep} anywhere in the
+simulator.
+
+Chaos stops at 70\% of the run and the cluster is then healed and stabilized so
+in-flight operations can drain. That is not cheating, it is what makes the check
+bite: \textbf{incomplete operations are the easiest thing for a linearizability
+checker to accept}, because it can always declare they never happened. A run
+that ended mid-chaos would look clean while testing very little.
+
+Four invariants are checked live, each failure naming its seed: election safety
+(at most one leader per term, tracked across the whole run), leader completeness
+(a new leader's log is checked against everything ever applied, at the moment it
+wins), state machine safety (two nodes applying different entries at one index
+is an immediate failure), and log matching.
+
+\subsection{The linearizability checker}
+
+Written from scratch: a Wing \& Gong exhaustive search with Lowe's memoization.
+Repeatedly pick an operation that is \emph{minimal} (real-time order permits it
+to go next), apply it to a model of a single register, and check the model
+reproduces what the client actually observed; backtrack when it cannot. Two
+decompositions make it tractable: keys are independent registers so each key is
+checked separately, and the set of linearized operations is a \textbf{bitmask
+integer}, making the memo key a single machine word. Incomplete operations
+branch both ways, implemented elegantly as a weaker acceptance test (every
+\emph{completed} op must be linearized; leftovers may be declared never to have
+happened).
+
+\begin{keyidea}{Three outcomes, never two}
+\code{OK}, \code{VIOLATION}, and \code{UNKNOWN}. The third is the honest one.
+Linearizability checking is NP-complete in general, so any checker must
+eventually refuse; this one refuses explicitly above 63 operations per key or
+2,000,000 explored states. The property that matters: it \textbf{never returns a
+false PASS or a false FAIL}, only sometimes a shrug. Note also that exhausting
+the search space with no explanation found is a \emph{proof} of violation, not a
+timeout.
+\end{keyidea}
+
+\subsection{Testing the tests}
+
+\begin{keyidea}{A safety net that never fires is indistinguishable from one that cannot fire}
+This is the best idea in the suite, and it appears three times independently.
+\code{test\_broken\_raft\_is\_caught} monkeypatches the quorum rule from
+\code{// 2 + 1} to \code{// 2}, deliberately making split brain possible, and
+asserts the harness detects a violation within 40 seeds. The checker is fed
+known-bad synthetic histories (stale read, lost update, phantom value) and must
+reject them. And \code{test\_same\_seed\_same\_run} runs a seed twice and
+compares a full history fingerprint, so determinism is asserted structurally
+rather than assumed.
+\end{keyidea}
+
+The README tells one story on itself that is worth repeating, because it is the
+same lesson at a smaller scale. The first ``checker budget'' test used 40
+incomplete concurrent puts and passed, but it passed for the wrong reason: a
+history of purely incomplete operations is trivially linearizable by declaring
+none of them happened, so the search finished instantly and exercised none of
+the mechanism it claimed to test. The fixed test buries a real violation under
+20 \emph{completed} concurrent puts, forcing the exhaustive search the budget
+exists to bound. A test that passes tells you nothing until you know why.
+
+% =====================================================================
+\section{Verified, not quoted}
+
+The claims below were \textbf{executed on this machine} for this document, from
+a clean virtual environment (Linux, Python 3.12.3, 8 cores), rather than copied
+from the README.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Claim (README)} & \textbf{Observed} & \textbf{Verdict} \\
+\midrule
+57 tests, all passing & \code{57 passed in 51.41s} & confirmed \\
+5000 seeds swept & 5000 seeds & confirmed \\
+\code{564170} client ops total & \code{564170} client ops total & confirmed, exactly \\
+0 failures & \code{0 failure(s)} & confirmed \\
+84.7s (59.0 seeds/s), 10 workers & 257.0s (19.5 seeds/s), 8 workers & differs; see below \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lstlisting}[caption={The headline sweep, run for this document}]
+$ .venv/bin/raftkv sim --seeds 5000 --workers 8
+5000 seeds in 257.0s (19.5 seeds/s), 564170 client ops total, 0 failure(s)
+\end{lstlisting}
+
+\begin{keyidea}{The op count reproduced to the digit, and that is the real result}
+The README's run used 10 workers; this one used 8, on a different machine, on a
+different day. The operation count came back \textbf{identical}. That is not a
+coincidence and it is not a weak check: it is the determinism claim confirmed
+end to end. Had any part of the system consulted a wall clock, a hash seed, a
+set iteration order, or the global \code{random} module, the same 5000 seeds
+would have produced a different number. They did not.
+\end{keyidea}
+
+\begin{honest}{The timing did not reproduce, and the gap is larger than the worker count explains}
+84.7s at 10 workers versus 257.0s at 8 workers is a factor of about 3; the
+worker ratio accounts for at most 1.25. This is not a discrepancy in the code:
+throughput is deliberately \emph{outside} the seed and depends on the machine
+and its load. \textbf{This run shared the machine with other substantial
+workloads}, which is the most likely explanation, but that is an
+\textbf{inference}: it was not isolated or measured, and the original run was
+not repeated under matched conditions. The honest position: the timing figure is
+a machine-and-day observation rather than a property of the project, while the
+two figures that \emph{are} properties of the project, the op count and the
+failure count, both reproduced exactly.
+\end{honest}
+
+\begin{honest}{What the headline number does and does not cover}
+``5,000 randomly generated disasters and 564,170 reads/writes with 0
+contradictions'' is true and was reproduced. Its scope is narrower than it
+sounds, and saying so is what makes it defensible:
+\begin{itemize}
+\item \textbf{5000 seeds is a deep search of one fixed scenario}, not a broad
+      search across scenarios: every seed runs the same recipe (3 nodes, 12
+      virtual seconds, the same fault probabilities) and varies only timing,
+      targets and ordering.
+\item \textbf{The ops are get, put and cas.} The simulated client has no
+      \code{delete} branch, so \code{delete} is never exercised end to end by
+      any of the 5000 seeds.
+\item \textbf{The simulated disks are perfect.} The simulator uses
+      \code{MemoryStorage}, an ideal disk that never tears a write. The
+      excellent torn-tail CRC recovery code in \code{FileStorage} is therefore
+      never touched by the sweep; it is covered only by targeted unit tests.
+      This is the largest gap between what the simulator tests and what
+      production runs, and the README names it.
+\item \textbf{Membership changes are never exercised by the sweep} either: the
+      nemesis crashes, partitions and skews, but never adds or removes a server.
+\item \textbf{``0 contradictions'' means no violation fired}, not that every
+      history was proven linearizable. \code{SimResult.ok} accepts
+      \code{UNKNOWN}, and the batch runner never counts it, so the sweep cannot
+      distinguish 5000 proofs from 4990 proofs and 10 shrugs. The configured
+      width almost certainly keeps every history inside the budget, but the
+      runner does not \emph{show} that, and it easily could.
+\end{itemize}
+\end{honest}
+
+% =====================================================================
+\section{Honest assessment}
+
+\subsection{What is genuinely strong}
+
+\begin{itemize}
+\item \textbf{The sans-IO boundary is real, not aspirational.} \file{raft/}
+      imports \code{enum}, \code{typing} and its own siblings, and nothing else.
+      The central architectural claim survives a grep.
+\item \textbf{The subtle rules are all present and correct}: vote persistence
+      before reply, the up-to-date check, the section 5.4.2 own-term commit
+      restriction with its no-op, a conflict hint that can only move
+      \code{next\_index} downward (so a confused hint costs a round trip, never
+      correctness), the directory fsync after rename, config effective on
+      append, and a leader that defers its own removal until it commits.
+\item \textbf{The tests test the tests}, three independent ways.
+\item \textbf{The honesty is load-bearing}: the \code{UNKNOWN} outcome, the
+      documented rejection of leader leases with reasons, and the README's own
+      limits section are the work of someone optimizing for being right rather
+      than for looking right.
+\end{itemize}
+
+\subsection{Weaknesses, ranked by what would hurt most under questioning}
+
+\begin{enumerate}
+\item \textbf{The simulator's disk is perfect, so the crash-recovery code is the
+      least-tested important code in the project.} The project's thesis is
+      ``search the schedule space''; storage faults are simply outside the
+      searched space. This is the answer to ``what would you do next'' and
+      should be volunteered, not conceded.
+\item \textbf{\code{UNKNOWN} is invisible} in \code{SimResult.ok} and in the
+      batch runner's output. A few lines would make the headline strictly
+      stronger.
+\item \textbf{Replication is naive and worst-case quadratic.} Every heartbeat to
+      a lagging follower re-sends the \emph{entire} remaining suffix, because
+      \code{next\_index} only advances on a reply. Correct, since AppendEntries
+      is idempotent, but with a 30 ms heartbeat and a follower 10,000 entries
+      behind that is the whole suffix serialized to JSON every 30 ms until the
+      first reply lands. There is no batch-size cap.
+\item \textbf{\code{\_load\_snapshot()} re-reads and re-parses the entire
+      persistent state, including the whole log, on every InstallSnapshot
+      send}, then ships the snapshot whole with no chunking.
+\item \textbf{No pre-vote}, so a healed node forces one pointless re-election
+      through term inflation.
+\item \textbf{Sessions never expire}, and the table is inside the replicated
+      state and every snapshot. Since the CLI builds a fresh client with a fresh
+      random id per invocation, every \code{raftkv put} from the command line
+      permanently adds a row.
+\item \textbf{Scale}: Python, JSON on the wire, one fsync per append batch, one
+      TCP connection per client request. The README's first honest limit says
+      plainly that this is a correctness project and not a fast store, which is
+      the right call.
+\end{enumerate}
+
+\subsection{Smaller things a careful reader will find}
+
+\begin{itemize}
+\item The checker validates \code{get} and \code{cas} results against the model
+      but treats \code{put} and \code{delete} as pure state transitions, so
+      \code{delete}'s \code{existed} flag is never checked.
+\item The log-matching invariant breaks at the first index where terms agree,
+      inferring the prefix from the Log Matching Property, which is the property
+      under test. It is partially circular; other layers still catch what it
+      misses.
+\item \code{next\_index} initialization disagrees with itself across three
+      functions (off by one in \code{\_change\_config}); self-correcting, so the
+      tests never see it.
+\item \code{\_config\_from}'s index filter is effectively vacuous at both call
+      sites.
+\end{itemize}
+
+% =====================================================================
+\section{What to take away}
+
+\begin{keyidea}{Five sentences}
+\textbf{One.} Consensus reduces to keeping an ordered log identical across
+machines; Raft does it by electing one leader per term who alone appends, and by
+requiring a majority for every decision, so that the overlap between any two
+majorities makes contradiction impossible.
+
+\textbf{Two.} Everything rests on sans-IO: \code{RaftNode} touches the world
+only through \code{Env} and \code{Storage}, so identical code runs over TCP and
+under the simulator, and every simulator bug is by construction a production
+bug.
+
+\textbf{Three.} Because all nondeterminism funnels through one seeded generator
+and one ordered event heap, a chaotic cluster lifetime is a pure function of one
+integer: thousands of disasters searchable in minutes, every failure
+reproducible forever.
+
+\textbf{Four.} Correctness is judged from the outside by a from-scratch
+linearizability checker that proves, refutes, or honestly says \code{UNKNOWN},
+and never guesses.
+
+\textbf{Five.} The safety nets are themselves tested, because a net that never
+fires is indistinguishable from one that cannot.
+\end{keyidea}
+
+\begin{center}
+\begin{tabular}{p{5.3cm}p{8.9cm}}
+\toprule
+\textbf{Likely question} & \textbf{Honest answer} \\
+\midrule
+Why not use an existing Raft library? & The point was to learn where the subtlety lives. Section 5.4.2 and the ReadIndex term-commit precondition are two places a plausible shortcut is a real linearizability bug, and the chaos harness found the second one during development. \\
+Is 5000 seeds meaningful? & It is a deep search of one fixed scenario, not a broad one. It reproduced to the digit at a different worker count, which is the determinism claim confirmed. \\
+What is not tested? & Storage faults (the simulated disk is perfect), \code{delete} end to end, membership changes under chaos, and anything beyond single-digit node counts on localhost. \\
+What would you do first? & Inject torn writes and fsync reordering into simulated storage, so the sweep covers the recovery paths that are currently only unit-tested. Then report \code{UNKNOWN} counts. \\
+Why ReadIndex, not leases? & Leases trade a round trip for an assumption about bounded clock drift between machines. In a project about testable correctness, an untestable hardware assumption is a bad trade. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vfill
+\begin{center}
+\small\itshape
+Every figure in the verification section was produced by running the code on
+this machine, not by quoting the README. Anything inferred is labelled inferred.
+Where code and documentation disagreed, the code was taken as the truth.
+For the exhaustive treatment, including the full state machine, the election and
+replication paths, the partition analysis, and a module-by-module walkthrough,
+see the companion Deep Dive.
+\end{center}
+
+\end{document}

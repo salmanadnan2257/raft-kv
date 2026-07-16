@@ -1,0 +1,2322 @@
+% explainer-source-hash: b61f9ba78915fdf5b2011a630b8496641f14462f328b2f9ba5f40a7d1eb57aaa
+% explainer-source-commit: ba9e27a6dfd9aac2ec9eea0d934bf2b9e5a3e06d
+% explainer-generated: 2026-07-16
+% Regenerate with /explain-all (see WIRING.md). Do not edit this stamp by hand:
+% it is how the toolchain knows whether this document still matches the code.
+\documentclass[11pt,a4paper]{article}
+\input{preamble}
+
+\title{\vspace{-1.5cm}\textbf{raft-kv}\\[0.3cm]
+\large A Distributed Key-Value Store with Raft Consensus,\\
+Deterministic Simulation, and a Linearizability Checker\\[0.4cm]
+\normalsize Deep Dive: an exhaustive, first-principles walkthrough}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{keyidea}{Read this first: what the project is, in one paragraph}
+\code{raft-kv} is a database that stores simple key-value pairs (like
+\code{city = lahore}) and keeps identical copies of that data on several
+computers at once, so that the data survives any one of them dying. Keeping
+several computers in exact agreement, while they crash and their network
+breaks, is the problem called \emph{consensus}. This project solves it with an
+algorithm called \emph{Raft}, written from scratch in Python with no consensus
+libraries. But the code that solves consensus is only about a third of the
+project. The other two thirds are the interesting part: a \emph{simulator} that
+can replay thousands of randomized disasters against the real consensus code
+in a way that is exactly reproducible from a single integer, and a
+\emph{linearizability checker} that mathematically verifies that the answers
+clients received could have come from a single, honest, non-distributed
+database.
+\end{keyidea}
+
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{Orientation: the problem, from zero}
+
+\subsection{Why one computer is not enough}
+
+Suppose you store data on one machine. A single hard disk failure, a power cut,
+or a careless \code{kill} command and the data is gone or unreachable. The
+obvious fix is to keep copies on several machines. That word, copies, is where
+all the difficulty starts.
+
+\begin{jargon}{Replication}
+Keeping more than one copy of the same data on more than one machine, so that
+the loss of any single machine does not lose the data. Each copy is called a
+\emph{replica}. The machines are also called \emph{nodes} or \emph{servers}.
+\end{jargon}
+
+\begin{jargon}{Node}
+One participating computer (or, in this project's tests, one process, or even
+one Python object). In \code{raft-kv} nodes have short string names:
+\code{n1}, \code{n2}, \code{n3}.
+\end{jargon}
+
+The naive design is: whenever a write arrives, send it to all three machines.
+That fails immediately, for reasons worth stating concretely:
+
+\begin{itemize}
+\item Machine \code{n3} is briefly down when the write arrives, so it misses
+      it. Its copy is now wrong, and nothing in the system knows.
+\item Two clients write different values to the same key at the same moment.
+      Machine \code{n1} happens to process them in one order, \code{n2} in the
+      other. The two copies now permanently disagree.
+\item The network splits in half. Machines on each side think the other side
+      died, and both sides keep accepting writes. Now there are two divergent
+      databases claiming to be the same database. This is called
+      \emph{split brain}, and it is the disease that consensus exists to
+      prevent.
+\end{itemize}
+
+\begin{jargon}{Split brain}
+Two or more sets of nodes each believe they are the authoritative cluster, and
+each accepts writes independently. When the network heals, there is no honest
+way to merge the two divergent versions of history: acknowledged writes must be
+thrown away. Any correct consensus algorithm makes split brain structurally
+impossible rather than merely unlikely.
+\end{jargon}
+
+\subsection{Consensus, from first principles}
+
+\begin{keyidea}{What consensus actually means}
+Consensus is the problem of getting a group of unreliable machines to agree on
+one \textbf{ordered list of decisions}, such that once a decision is agreed, it
+is agreed forever, by everyone, and no two machines ever disagree about what
+decision number 7 was. That is the whole idea. Everything else in Raft is
+machinery to make that safe under crashes and network failure.
+\end{keyidea}
+
+Notice the pivot: the group does not agree on ``the value of the key
+\code{city}''. It agrees on an ordered \emph{list of commands}:
+
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{Position} & \textbf{Command} \\
+\midrule
+1 & \code{put city = lahore} \\
+2 & \code{put team = raptors} \\
+3 & \code{cas team: raptors $\rightarrow$ dinos} \\
+4 & \code{delete city} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+If every machine agrees on that list, and every machine executes the list in
+order starting from an empty database, then every machine ends up with an
+identical database, necessarily. Agreement on the data is derived for free from
+agreement on the list. This trick has a name.
+
+\begin{jargon}{Replicated state machine}
+A design where each node holds (a) an identical ordered log of commands and
+(b) a deterministic program that executes those commands in order. Because the
+program is deterministic (same inputs, same order, same outputs, always) and
+the log is identical, the resulting state is identical on every node. The hard
+problem is reduced to: keep the logs identical. In this project the log is
+\code{raft/log.py}, and the deterministic program is \code{kv/machine.py}.
+\end{jargon}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[node distance=6mm]
+\node[box, minimum width=30mm] (c) {Client\\\scriptsize{}put city = lahore};
+
+\node[draw=inkblue, fill=softgrey, rounded corners=3pt,
+      minimum width=42mm, minimum height=34mm, right=22mm of c] (n1f) {};
+\node[lbl, anchor=north] at (n1f.north) {node n1 (leader)};
+\node[box, minimum width=34mm] (l1) at ($(n1f.center)+(0,3mm)$)
+      {log: [1:put city, 2:...]};
+\node[store, minimum width=24mm] (m1) at ($(n1f.center)+(0,-10mm)$)
+      {\scriptsize state machine};
+
+\node[draw=linegrey, fill=white, rounded corners=3pt,
+      minimum width=42mm, minimum height=34mm, right=16mm of n1f] (n2f) {};
+\node[lbl, anchor=north] at (n2f.north) {node n2 (follower)};
+\node[box, minimum width=34mm] (l2) at ($(n2f.center)+(0,3mm)$)
+      {log: [1:put city, 2:...]};
+\node[store, minimum width=24mm] (m2) at ($(n2f.center)+(0,-10mm)$)
+      {\scriptsize state machine};
+
+\node[draw=linegrey, fill=white, rounded corners=3pt,
+      minimum width=42mm, minimum height=34mm, right=16mm of n2f] (n3f) {};
+\node[lbl, anchor=north] at (n3f.north) {node n3 (follower)};
+\node[box, minimum width=34mm] (l3) at ($(n3f.center)+(0,3mm)$)
+      {log: [1:put city, 2:...]};
+\node[store, minimum width=24mm] (m3) at ($(n3f.center)+(0,-10mm)$)
+      {\scriptsize state machine};
+
+\draw[flow] (c) -- (n1f);
+\draw[flow] (l1) -- node[lbl, above]{replicate} (l2);
+\draw[flow] (l2) -- node[lbl, above]{replicate} (l3);
+\draw[flow] (l1) -- node[lbl, right]{apply in order} (m1);
+\draw[flow] (l2) -- node[lbl, right]{apply in order} (m2);
+\draw[flow] (l3) -- node[lbl, right]{apply in order} (m3);
+\end{tikzpicture}}
+\caption{The replicated state machine. Agreement on the ordered log makes
+agreement on the data automatic, because applying the same commands in the same
+order to the same starting state must produce the same result.}
+\end{figure}
+
+\subsection{The majority rule: why three, not two}
+
+The single mechanism that makes split brain impossible is deceptively small.
+
+\begin{keyidea}{Quorums, and why they work}
+Every important decision requires the agreement of a strict majority of the
+cluster (a \emph{quorum}): 2 out of 3, 3 out of 5. The reason this works is a
+fact about sets, not about computers: \textbf{any two majorities of the same
+set must share at least one member}. Two majorities of \{n1, n2, n3\} cannot be
+disjoint, because 2 + 2 > 3. So if a decision needs a majority, and some node
+in every majority remembers the previous decision, no second, contradictory
+decision can slip through unseen. A partition can therefore leave at most
+\emph{one} side with a majority; the other side is mathematically unable to act.
+\end{keyidea}
+
+\begin{jargon}{Quorum / majority}
+More than half the nodes in the current cluster configuration. In this code it
+is one line, \code{raft/node.py}: \code{len(self.config) // 2 + 1}. For 3 nodes
+that is 2; for 4 nodes it is 3, which is why even-sized clusters buy you
+nothing: a 4-node cluster tolerates exactly one failure, the same as a 3-node
+cluster, while being more expensive and slower.
+\end{jargon}
+
+This is why the project's self-test (section~\ref{sec:canary}) attacks
+precisely this line. Weaken \code{// 2 + 1} into \code{// 2} and the majority
+overlap guarantee evaporates, split brain becomes possible, and the whole
+edifice falls. It is the load-bearing wall.
+
+\subsection{Linearizability: the correctness target}
+
+Replication is not the goal. Replication that behaves \emph{as if it were not
+replicated} is the goal.
+
+\begin{jargon}{Linearizability}
+The strongest single-object consistency guarantee. A system is linearizable if
+every operation appears to take effect \textbf{instantaneously at some single
+moment between the client sending the request and receiving the response}, and
+that ordering of moments is consistent with real time. The practical meaning:
+if your write finished at 10:00:01, then \emph{every} read that starts at
+10:00:02, on any node, from any client, must see it. The distributed system is
+indistinguishable, from the outside, from a single-threaded program holding one
+copy of the data.
+\end{jargon}
+
+\begin{keyidea}{Why linearizability is the interesting property to check}
+It is a property of the \emph{observable history} (what clients asked, and what
+they were told), not of the implementation. That makes it checkable from the
+outside, without trusting the code. If a system's history is linearizable, no
+client could ever have detected that it was distributed. If it is not, some
+client saw the seams: a value from the past, a write that vanished, a value
+that never existed.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.92\textwidth}{!}{
+\begin{tikzpicture}[x=1cm, y=1cm]
+\draw[->, thick, draw=inkblue] (0,0) -- (13.2,0) node[right, font=\small]{time};
+
+% ok example
+\node[font=\small\bfseries, text=okgreen, anchor=west] at (0,3.4) {Linearizable: a legal moment exists for each operation};
+\draw[very thick, draw=accent] (0.6,2.7) -- (3.2,2.7);
+\node[lbl, above] at (1.9,2.75) {C1: put city=lahore};
+\filldraw[accent] (2.4,2.7) circle (2.2pt);
+\node[lbl, below, text=okgreen] at (2.4,2.62) {takes effect};
+
+\draw[very thick, draw=accent] (2.0,1.9) -- (4.6,1.9);
+\node[lbl, above] at (3.3,1.95) {C2: get city $\rightarrow$ lahore};
+\filldraw[accent] (3.4,1.9) circle (2.2pt);
+\node[lbl, below, text=okgreen] at (3.4,1.82) {after the put: legal};
+
+\draw[very thick, draw=accent] (5.4,2.7) -- (7.6,2.7);
+\node[lbl, above] at (6.5,2.75) {C3: get city $\rightarrow$ lahore};
+\filldraw[accent] (6.5,2.7) circle (2.2pt);
+
+% bad example
+\node[font=\small\bfseries, text=warnred, anchor=west] at (0,1.0) {Violation: no legal moment exists};
+\draw[very thick, draw=warnred] (8.6,2.7) -- (10.2,2.7);
+\node[lbl, above] at (9.4,2.75) {C1: put city=lahore};
+\filldraw[warnred] (9.8,2.7) circle (2.2pt);
+\draw[very thick, draw=warnred] (10.9,2.7) -- (12.8,2.7);
+\node[lbl, above] at (11.85,2.75) {C2: get city $\rightarrow$ (nil)};
+\node[lbl, below, text=warnred, align=center] at (11.85,2.62)
+  {the put COMPLETED before\\this get STARTED, yet it\\was not seen: illegal};
+\draw[dashed, draw=warnred] (10.2,2.5) -- (10.2,1.4);
+\draw[dashed, draw=warnred] (10.9,2.5) -- (10.9,1.4);
+\draw[<->, draw=warnred] (10.2,1.5) -- node[lbl, below, text=warnred]{no overlap: real-time order is forced} (10.9,1.5);
+\end{tikzpicture}}
+\caption{Left: operations overlap in real time, so the checker is free to pick
+an order that explains every observed result. Right: two operations that do not
+overlap have their order fixed by real time; if the results contradict that
+order, no explanation exists and the history is a violation.}
+\end{figure}
+
+\subsection{The project's real thesis}
+
+The README states the motivation directly: consensus code is easy to write and
+nearly impossible to trust from example-based tests, because the bugs live in
+message interleavings you will never hit on a laptop. So the project's central
+bet, borrowed from the FoundationDB database's testing philosophy, is:
+
+\begin{keyidea}{The thesis: make the whole distributed system a pure function of one integer}
+Every source of randomness in a distributed system (what time it is, how long a
+message takes, whether a message is lost, when a node crashes, when the network
+splits, what the client does next) is replaced by draws from a single seeded
+random number generator. A whole 12-second cluster lifetime under sustained
+chaos then becomes a \emph{deterministic function of a seed}. That buys three
+things at once: you can run thousands of universes in seconds because no real
+time passes; a failure report is one integer rather than a shrug; and the
+failing schedule replays exactly, forever, under a debugger.
+\end{keyidea}
+
+This only works if one condition holds, and the entire architecture is bent
+around it: \textbf{the simulated system must be the real system}. If the
+simulator tests a copy of the consensus logic, it tests nothing. The mechanism
+that achieves this is the sans-IO core, section~\ref{sec:sansio}.
+
+% =====================================================================
+\section{The map: what is where}
+
+\subsection{Directory structure}
+
+\begin{figure}[H]
+\centering
+\begin{forest} dirtree
+[raft-kv/
+  [src/raftkv/
+    [raft/ \quad{\rmfamily\itshape the consensus core: no sockets, no clocks, no asyncio}
+      [node.py \quad{\rmfamily\itshape RaftNode, 576 lines: the algorithm itself}]
+      [log.py \quad{\rmfamily\itshape snapshot-aware log index arithmetic}]
+      [storage.py \quad{\rmfamily\itshape Storage protocol, FileStorage (fsync), MemoryStorage}]
+      [messages.py \quad{\rmfamily\itshape the six RPC types, as dataclasses}]
+      [env.py \quad{\rmfamily\itshape Env protocol: now / call\_later / send / rng}]
+    ]
+    [kv/machine.py \quad{\rmfamily\itshape the replicated state machine + session table}]
+    [transport/tcp.py \quad{\rmfamily\itshape real asyncio TCP + AsyncioEnv (production)}]
+    [sim/ \quad{\rmfamily\itshape the deterministic simulator (test-only)}
+      [clock.py \quad{\rmfamily\itshape SimClock: one event heap, virtual time}]
+      [network.py \quad{\rmfamily\itshape SimNetwork + SimEnv: loss, delay, partitions, skew}]
+      [harness.py \quad{\rmfamily\itshape 439 lines: cluster, clients, nemesis, invariants}]
+      [batch.py \quad{\rmfamily\itshape parallel seed sweep runner}]
+    ]
+    [checker/ \quad{\rmfamily\itshape the linearizability checker}
+      [history.py \quad{\rmfamily\itshape Op and HistoryRecorder}]
+      [linearizability.py \quad{\rmfamily\itshape Wing \& Gong search + Lowe memoization}]
+    ]
+    [server.py \quad{\rmfamily\itshape one TCP node: storage + machine + node + transport}]
+    [client.py \quad{\rmfamily\itshape retrying client with leader hints and write dedup}]
+    [cli/main.py \quad{\rmfamily\itshape the raftkv command}]
+  ]
+  [tests/ \quad{\rmfamily\itshape 57 tests across 10 files}]
+  [docs/ \quad{\rmfamily\itshape ARCHITECTURE.md, TESTING.md, this document}]
+  [demo.sh \quad{\rmfamily\itshape start cluster, kill -9 the leader, prove no data loss}]
+  [pyproject.toml \quad{\rmfamily\itshape packaging; zero runtime dependencies}]
+]
+\end{forest}
+\caption{The repository. The single most important boundary in the tree is that
+\file{raft/} imports nothing from \file{sim/} or \file{transport/}: the arrow
+of dependency points inward, always.}
+\end{figure}
+
+\subsection{The architecture in one picture}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[node distance=10mm]
+
+% core
+\node[draw=inkblue, very thick, fill=softgrey, rounded corners=4pt,
+      minimum width=54mm, minimum height=42mm] (core) {};
+\node[font=\small\bfseries, text=inkblue, anchor=north] at ($(core.north)+(0,-2mm)$)
+      {raft/ : the sans-IO core};
+\node[box, minimum width=44mm] (rn) at ($(core.center)+(0,6mm)$) {RaftNode (node.py)};
+\node[box, minimum width=20mm] (rl) at ($(core.center)+(-11mm,-6mm)$) {RaftLog};
+\node[box, minimum width=20mm] (rm) at ($(core.center)+(12mm,-6mm)$) {Messages};
+\node[lbl, anchor=south] at ($(core.south)+(0,2mm)$)
+      {\itshape no import of asyncio, time, socket, or global random};
+
+% two ports
+\node[dec, above left=14mm and 6mm of core, minimum width=18mm] (env) {Env\\protocol};
+\node[dec, above right=14mm and 6mm of core, minimum width=18mm] (sto) {Storage\\protocol};
+\draw[flow] (rn) -- node[lbl, left]{now, call\_later,\\send, rng} (env);
+\draw[flow] (rn) -- node[lbl, right]{load, append,\\truncate, snapshot} (sto);
+
+% production side
+\node[draw=okgreen, fill=white, rounded corners=4pt, minimum width=46mm,
+      minimum height=30mm, above left=8mm and 4mm of env] (prod) {};
+\node[font=\small\bfseries, text=okgreen, anchor=north] at ($(prod.north)+(0,-2mm)$) {PRODUCTION};
+\node[extbox, minimum width=36mm] (aenv) at ($(prod.center)+(0,4mm)$) {AsyncioEnv + TcpTransport\\\scriptsize{}real clock, real sockets};
+\node[extbox, minimum width=36mm] (fs) at ($(prod.center)+(0,-7mm)$) {FileStorage\\\scriptsize{}fsync, CRC, atomic rename};
+
+% sim side
+\node[draw=accent, fill=white, rounded corners=4pt, minimum width=46mm,
+      minimum height=30mm, above right=8mm and 4mm of sto] (simb) {};
+\node[font=\small\bfseries, text=accent, anchor=north] at ($(simb.north)+(0,-2mm)$) {SIMULATION};
+\node[extbox, minimum width=36mm] (senv) at ($(simb.center)+(0,4mm)$) {SimEnv + SimNetwork + SimClock\\\scriptsize{}virtual time, seeded chaos};
+\node[extbox, minimum width=36mm] (ms) at ($(simb.center)+(0,-7mm)$) {MemoryStorage\\\scriptsize{}a perfect disk};
+
+\draw[dflow] (aenv) -- (env);
+\draw[dflow] (fs) to[out=0,in=160] (sto);
+\draw[dflow] (senv) to[out=180,in=20] (env);
+\draw[dflow] (ms) -- (sto);
+
+% consumers
+\node[box, minimum width=26mm, below left=12mm and 2mm of core] (srv) {server.py\\\scriptsize{}RaftServer};
+\node[box, minimum width=26mm, below right=12mm and 2mm of core] (har) {sim/harness.py\\\scriptsize{}SimCluster};
+\draw[flow] (srv) -- (core);
+\draw[flow] (har) -- (core);
+\node[box, minimum width=24mm, below=8mm of srv] (cli) {cli/ + client.py};
+\node[box, minimum width=24mm, below=8mm of har] (chk) {checker/};
+\draw[flow] (cli) -- (srv);
+\draw[flow] (har) -- node[lbl, right]{client history} (chk);
+\node[store, minimum width=22mm, left=8mm of core] (kv) {kv/machine.py\\\scriptsize{}KVMachine};
+\draw[flow] (rn) -- node[lbl, above, sloped]{apply(entry)} (kv);
+\end{tikzpicture}}
+\caption{The whole system. \code{RaftNode} sits in the middle and can only
+touch the world through two narrow protocols, \code{Env} and \code{Storage}.
+Production plugs real sockets and a real disk into those two sockets;
+the simulator plugs in a virtual clock and a seeded chaos network. The
+\emph{same} \code{RaftNode} object graph runs in both.}
+\end{figure}
+
+% =====================================================================
+\section{The central design decision: sans-IO}
+\label{sec:sansio}
+
+\begin{jargon}{Sans-IO}
+French for ``without IO''. A design style in which a protocol implementation
+performs no input or output itself. It never opens a socket, never reads a
+clock, never sleeps. Instead it is a pure-ish state machine: you feed it events
+(``this message arrived'', ``this timer fired'', ``the local application wants
+to propose a command''), and it returns or emits \emph{intentions} (``send this
+message to n2'', ``call me back in 30 milliseconds''). Somebody else, the
+so-called IO layer, actually performs those intentions.
+\end{jargon}
+
+\code{RaftNode} reacts to exactly three stimuli and produces effects through
+exactly two protocols. That is the whole contract, and it fits in a box:
+
+\begin{figure}[H]
+\centering
+\resizebox{0.98\textwidth}{!}{
+\begin{tikzpicture}[node distance=8mm]
+\node[box, minimum width=34mm, minimum height=30mm] (n) {\textbf{RaftNode}\\\scriptsize{}pure state machine};
+
+\node[extbox, left=26mm of n, minimum width=34mm, yshift=13mm] (s1)
+  {\code{handle\_message(src, msg)}\\\scriptsize{}a peer said something};
+\node[extbox, left=26mm of n, minimum width=34mm] (s2)
+  {timer callback\\\scriptsize{}scheduled earlier via call\_later};
+\node[extbox, left=26mm of n, minimum width=34mm, yshift=-13mm] (s3)
+  {\code{propose} / \code{read\_index}\\\code{add\_server} / \code{remove\_server}\\\scriptsize{}the local application asked};
+
+\node[extbox, right=26mm of n, minimum width=34mm, yshift=13mm] (e1)
+  {\code{env.send(dest, msg)}};
+\node[extbox, right=26mm of n, minimum width=34mm] (e2)
+  {\code{env.call\_later(d, fn)}};
+\node[extbox, right=26mm of n, minimum width=34mm, yshift=-13mm] (e3)
+  {\code{storage.save\_term\_vote}\\\code{storage.append\_entries} \dots};
+
+\draw[flow] (s1) -- (n);
+\draw[flow] (s2) -- (n);
+\draw[flow] (s3) -- (n);
+\draw[flow] (n) -- (e1);
+\draw[flow] (n) -- (e2);
+\draw[flow] (n) -- (e3);
+\node[lbl, above=1mm of n] {IN: three stimuli \qquad OUT: two protocols};
+\end{tikzpicture}}
+\caption{The sans-IO contract of \code{RaftNode}. Nothing else crosses the
+boundary.}
+\end{figure}
+
+The \code{Env} protocol is 6 meaningful lines, in \file{raft/env.py}:
+
+\begin{lstlisting}[language=Python, caption={raft/env.py: the entire abstraction that makes the project testable}]
+class Env(Protocol):
+    rng: random.Random
+
+    def now(self) -> float: ...
+    def call_later(self, delay: float, fn: Callable[[], None]) -> TimerHandle: ...
+    def send(self, dest: str, msg: Message) -> None: ...
+\end{lstlisting}
+
+\begin{keyidea}{Why this tiny file is the most important one in the repository}
+Because \code{RaftNode} takes its randomness from \code{env.rng} rather than
+the global \code{random} module, and its time from \code{env.now()} rather than
+\code{time.time()}, the simulator can supply a seeded generator and a virtual
+clock, and the node cannot tell the difference. That is what makes ``run 5000
+chaos schedules in 90 seconds'' an ordinary function call. And crucially, it
+means every bug the simulator finds is a bug in the code that runs in
+production, because it \emph{is} the code that runs in production. There is no
+test double of the algorithm anywhere in this repository.
+\end{keyidea}
+
+Note the direction of the dependency arrow. \code{Env} and \code{Storage} are
+declared as \code{typing.Protocol}, which in Python means structural typing:
+any object with the right method names satisfies them, with no inheritance and
+no import. So \file{raft/} declares what it needs, and \file{sim/} and
+\file{transport/} depend on \file{raft/}, never the reverse. This is dependency
+inversion, and it is why \file{raft/node.py} contains no \code{if testing:}
+branch anywhere.
+
+% =====================================================================
+\section{Raft: the algorithm, and this implementation of it}
+
+Raft is defined by Diego Ongaro and John Ousterhout's 2014 paper ``In Search of
+an Understandable Consensus Algorithm'', with log compaction and membership
+changes taken from Ongaro's Stanford dissertation. This section explains the
+algorithm from scratch and then shows exactly how \file{raft/node.py}
+implements each piece.
+
+\subsection{Terms: logical time}
+
+\begin{jargon}{Term}
+A number that only ever increases, acting as a logical clock. Each term begins
+with an election. At most one node may be leader in a given term. Every message
+carries its sender's term. The rule is unconditional and lives at the very top
+of \code{handle\_message}: if you receive any message with a term greater than
+your own, you immediately adopt that term and become a follower, whatever you
+were doing. Terms let nodes detect stale information without any assumption
+about real clocks being synchronized.
+\end{jargon}
+
+\begin{lstlisting}[language=Python, caption={raft/node.py: the term rule, applied before dispatch, to every message type}]
+def handle_message(self, src: str, msg: Message) -> None:
+    if msg.term > self.current_term:
+        self._step_down(msg.term)
+    if isinstance(msg, RequestVote):
+        self._on_request_vote(msg)
+    # ... dispatch to the other five handlers
+\end{lstlisting}
+
+\subsection{The three roles, and the state machine}
+
+Every node is, at any instant, in exactly one of three roles.
+
+\begin{itemize}
+\item \textbf{Follower}: passive. Answers requests from leaders and candidates.
+      Does nothing on its own except notice silence.
+\item \textbf{Candidate}: campaigning. It got bored of the silence and is
+      asking for votes.
+\item \textbf{Leader}: in charge. It alone accepts client writes, it alone
+      appends to the log, and it sends periodic heartbeats to suppress
+      elections.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.99\textwidth}{!}{
+\begin{tikzpicture}[font=\small]
+
+\node[box, minimum width=32mm, minimum height=14mm] (f)
+  {\textbf{FOLLOWER}\\\scriptsize{}passive, obeys the leader};
+\node[box, minimum width=32mm, minimum height=14mm, right=44mm of f] (c)
+  {\textbf{CANDIDATE}\\\scriptsize{}campaigning for votes};
+\node[box, minimum width=32mm, minimum height=14mm, right=44mm of c] (l)
+  {\textbf{LEADER}\\\scriptsize{}appends, replicates,\\\scriptsize{}heartbeats};
+
+\node[lbl, left=12mm of f, align=center] (start) {start\\(also after a\\restart from disk)};
+\draw[flow] (start) -- (f);
+
+% self loops, on top
+\draw[flow] (f) to[out=115, in=65, looseness=5.5]
+  node[lbl, above, align=center, pos=0.5]{heartbeat received\\$\Rightarrow$ reset election timer} (f);
+\draw[flow] (c) to[out=115, in=65, looseness=5.5]
+  node[lbl, above, align=center, pos=0.5]{split vote:\\timeout again\\$\Rightarrow$ term += 1,\\campaign anew} (c);
+\draw[flow] (l) to[out=115, in=65, looseness=5.5]
+  node[lbl, above, align=center, pos=0.5]{heartbeat tick\\$\Rightarrow$ broadcast AppendEntries} (l);
+
+% forward edges
+\draw[flow] (f) -- node[lbl, below, align=center, pos=0.5]
+  {\textbf{1. election timeout}\\silence for a random time in [T, 2T]\\$\Rightarrow$ term += 1, vote for self,\\fsync, send RequestVote} (c);
+\draw[flow] (c) -- node[lbl, above, align=center, pos=0.5]
+  {\textbf{2. votes from a majority}\\$\Rightarrow$ append a no-op entry\\of my own term,\\start heartbeat timer} (l);
+
+% return edges, well separated vertically
+\draw[flow] (c) to[out=235, in=305] node[lbl, below, align=center, pos=0.5]
+  {\textbf{3. a current leader exists}\\(a valid AppendEntries arrives)\\or a higher term is seen} (f);
+
+\draw[flow] (l) to[out=265, in=275, looseness=1.1] node[lbl, below, align=center, pos=0.5]
+  {\textbf{4. a higher term is seen}, or I am removed from the config\\
+   $\Rightarrow$ \code{\_step\_down}: cancel heartbeats, fail every pending read and write} (f);
+\end{tikzpicture}}
+\caption{The Raft role state machine as implemented in \file{raft/node.py}.
+Note the asymmetry that makes Raft understandable: there is no
+follower-to-leader edge and no leader-to-candidate edge. Power is only ever
+taken through an election, and only ever surrendered by stepping down to
+follower.}
+\label{fig:statemachine}
+\end{figure}
+
+\begin{honest}{An implementation detail worth knowing: the timer never stops}
+\code{\_on\_election\_timeout} re-arms itself \emph{before} checking whether it
+should act, and returns early if the node is a leader or is not in its own
+configuration. So the election timer keeps firing forever on every node, even
+the leader, and even a removed node; it just does nothing. This is harmless and
+simplifies the code (there is exactly one place that arms the election timer),
+but it means a reader looking for ``where does the leader cancel its election
+timer'' will not find it, because it does not.
+\end{honest}
+
+\subsection{Leader election, step by step}
+
+\begin{jargon}{Election timeout}
+How long a follower waits without hearing from a leader before it assumes the
+leader is dead and starts campaigning. The critical detail is that it is
+\textbf{randomized} per node and per attempt, drawn uniformly from
+\code{[T, 2T]}. If it were a fixed constant, all followers would time out at the
+same instant, all campaign at once, all split the vote, all fail, and repeat
+forever. Randomization is what makes some node reliably go first and win.
+\end{jargon}
+
+\begin{lstlisting}[language=Python, caption={raft/node.py: randomized timeout, drawn from the injected rng, never the global one}]
+def _reset_election_timer(self) -> None:
+    if self._election_timer is not None:
+        self._election_timer.cancel()
+    delay = self.env.rng.uniform(self.election_timeout, 2 * self.election_timeout)
+    self._election_timer = self.env.call_later(delay, self._on_election_timeout)
+\end{lstlisting}
+
+\begin{pseudocode}{Election, as implemented in \_start\_election and \_on\_request\_vote}
+\Step{ON election timeout (follower or candidate, and I am in my own config):}
+\Indent{role $\leftarrow$ CANDIDATE}
+\Indent{currentTerm $\leftarrow$ currentTerm + 1}
+\Indent{votedFor $\leftarrow$ me}
+\Indent{\textbf{PERSIST} (term, votedFor) to storage \quad // before any message leaves}
+\Indent{votes $\leftarrow$ \{me\}}
+\Indent{IF votes $\geq$ majority THEN become leader \quad // single-node cluster}
+\Indent{send RequestVote(term, me, lastLogIndex, lastLogTerm) to every peer}
+\Step{}
+\Step{ON RequestVote(m) received:}
+\Indent{granted $\leftarrow$ false}
+\Indent{IF m.term == currentTerm AND votedFor IN \{none, m.candidateId\}:}
+\Indent{\quad upToDate $\leftarrow$ (m.lastLogTerm, m.lastLogIndex) $\geq$ (myLastLogTerm, myLastLogIndex)}
+\Indent{\quad IF upToDate:}
+\Indent{\quad\quad granted $\leftarrow$ true; votedFor $\leftarrow$ m.candidateId}
+\Indent{\quad\quad \textbf{PERSIST} (term, votedFor); reset election timer}
+\Indent{reply RequestVoteReply(currentTerm, me, granted)}
+\Step{}
+\Step{ON RequestVoteReply(m), if I am still a CANDIDATE in term m.term:}
+\Indent{IF m.voteGranted AND m.voterId in my config: votes $\leftarrow$ votes $\cup$ \{m.voterId\}}
+\Indent{IF |votes| $\geq$ majority: become leader}
+\end{pseudocode}
+
+Two subtleties in that pseudocode carry enormous weight.
+
+\begin{keyidea}{Persist the vote before replying, or lose safety}
+\code{\_persist\_term\_vote()} is called \emph{before} the reply is sent, both
+when campaigning and when granting a vote. If a node granted a vote, crashed,
+recovered with no memory of it, and granted a second vote for the same term to
+a different candidate, two candidates could each collect a majority in one
+term, and there would be two leaders. Durability of \code{votedFor} is not
+bookkeeping; it is what makes ``at most one leader per term'' true across
+crashes.
+\end{keyidea}
+
+\begin{keyidea}{The up-to-date check: elections are a filter, not a lottery}
+A voter refuses any candidate whose log is less up to date than its own, where
+``more up to date'' means: higher last term wins; if the last terms tie, the
+longer log wins. In Python that comparison is literally a tuple comparison,
+\code{(msg.last\_log\_term, msg.last\_log\_index) >= (self.log.last\_term,
+self.log.last\_index)}. This is the paper's section 5.4.1, and it is what makes
+the \emph{Leader Completeness} property true: since a winner needs a majority,
+and any majority overlaps the majority that stored any committed entry, and
+every voter refuses anyone missing entries it holds, a node missing a committed
+entry can never win. Committed data therefore survives every leader change,
+automatically, with no data transfer during the election itself.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.94\textwidth}{!}{
+\begin{tikzpicture}[x=1cm, y=1cm]
+% lifelines
+\foreach \x/\n in {0/n1, 4.6/n2, 9.2/n3} {
+  \node[box, minimum width=18mm] at (\x,7.6) {\n};
+  \draw[dashed, draw=linegrey, thick] (\x,7.2) -- (\x,-1.1);
+}
+% silence
+\node[lbl, align=center, fill=softgrey, draw=linegrey] at (4.6,6.8)
+  {the leader has died: no heartbeats reach anyone};
+
+% n1 times out first
+\node[lbl, anchor=east, align=right, text=warnred] at (-0.3,6.0) {election timeout fires\\(randomized: n1 first)};
+\filldraw[warnred] (0,6.0) circle (2.5pt);
+\node[lbl, anchor=east, align=right] at (-0.4,5.2) {term 1 $\rightarrow$ 2\\votedFor = n1\\\textbf{fsync before replying}};
+
+\draw[flow] (0,4.5) -- node[lbl, above, pos=0.5]{RequestVote(term=2, lastIdx=5, lastTerm=1)} (4.6,4.5);
+\draw[flow] (0,4.5) -- (9.2,4.5);
+
+\node[lbl, anchor=north west, align=left] at (4.75,4.2) {term 1 $<$ 2: adopt term 2.\\my log is not newer:\\\textbf{grant}, fsync votedFor=n1};
+\node[lbl, anchor=north west, align=left] at (9.35,4.2) {same: \textbf{grant}};
+
+\draw[flow] (4.6,2.9) -- node[lbl, above, pos=0.5]{VoteGranted} (0,2.9);
+\node[lbl, anchor=east, align=right, text=okgreen] at (-0.3,2.4) {votes = \{n1, n2\}\\2 $\geq$ majority(3) = 2\\\textbf{LEADER}};
+\filldraw[okgreen] (0,2.9) circle (2.5pt);
+\draw[flow] (9.2,2.2) -- node[lbl, below, pos=0.42]{VoteGranted (arrives late, already won: ignored)} (0,1.9);
+
+\node[lbl, anchor=east, align=right] at (-0.4,1.3) {append no-op\\at index 6, term 2};
+
+\draw[flow] (0,0.7) -- node[lbl, above, pos=0.5]{AppendEntries(term=2, entries=[6:noop])} (4.6,0.7);
+\draw[flow] (0,0.7) -- (9.2,0.7);
+\node[lbl, anchor=north west, align=left] at (4.75,0.4) {reset election timer;\\n1 is my leader};
+\node[lbl, anchor=north west, align=left] at (9.35,0.4) {reset election timer};
+\end{tikzpicture}}
+\caption{One election, end to end. n1's randomized timer fires first, so it
+campaigns alone and wins immediately; n3's vote arrives after the fact and is
+ignored. The new leader's first act is to append a no-op entry, for the reason
+explained in section~\ref{sec:commitrule}.}
+\label{fig:election}
+\end{figure}
+
+\subsection{Log replication}
+
+\begin{jargon}{Log entry}
+One record in the ordered list. In \file{raft/messages.py} it is a frozen
+dataclass with four fields: \code{index} (its 1-based position, never reused),
+\code{term} (the term of the leader that created it), \code{kind}, and
+\code{data}. There are exactly three kinds in this codebase:
+\code{"command"} (a KV operation to run), \code{"config"} (a cluster membership
+change), and \code{"noop"} (an empty entry a new leader appends to itself).
+\end{jargon}
+
+\begin{jargon}{Commit / committed}
+An entry is \emph{committed} once the leader has stored it on a majority of the
+cluster. Committed means permanent: it will be present in every future leader's
+log and will eventually be applied on every node. Uncommitted entries can still
+be thrown away. \code{commit\_index} is the highest index known committed;
+\code{last\_applied} is the highest index actually executed against the state
+machine. The gap between them is entries that are decided but not yet run.
+\end{jargon}
+
+The leader tracks two numbers per follower, and understanding the difference is
+most of understanding replication:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Field} & \textbf{Meaning} & \textbf{Nature} \\
+\midrule
+\code{next\_index[p]} & the next index I will \emph{try} to send p & optimistic guess \\
+\code{match\_index[p]} & the highest index I \emph{know} p has stored & proven fact \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+On becoming leader, \code{next\_index} is set optimistically to
+\code{last\_index + 1} for everyone and \code{match\_index} to 0 for everyone:
+``I assume you are caught up, and I have proof of nothing.'' Reality then
+corrects the guess.
+
+\begin{pseudocode}{AppendEntries on the follower (\_on\_append\_entries), the consistency check}
+\Step{ON AppendEntries(m):}
+\Indent{IF m.term $<$ currentTerm: reply(success=false) \quad // stale leader, ignore}
+\Indent{IF role != FOLLOWER: step down \quad // a valid leader exists for this term}
+\Indent{leaderHint $\leftarrow$ m.leaderId; reset election timer}
+\Step{}
+\Indent{// THE LOG MATCHING CHECK: do we agree on the entry just before these?}
+\Indent{IF term\_at(m.prevLogIndex) != m.prevLogTerm:}
+\Indent{\quad // We disagree. Tell the leader WHERE, so it can back up fast.}
+\Indent{\quad IF we have no entry there at all: conflict $\leftarrow$ myLastIndex + 1}
+\Indent{\quad ELSE: conflict $\leftarrow$ first index of the conflicting term}
+\Indent{\quad reply(success=false, conflictIndex=conflict); RETURN}
+\Step{}
+\Indent{// We agree up to prevLogIndex. Merge the new entries.}
+\Indent{FOR each entry e in m.entries:}
+\Indent{\quad IF we have nothing at e.index: append it}
+\Indent{\quad ELSE IF our term at e.index != e.term:}
+\Indent{\quad\quad TRUNCATE our log from e.index onward \quad // ours was wrong; leader wins}
+\Indent{\quad\quad append e}
+\Indent{\quad // ELSE: identical entry already present, skip}
+\Indent{persist appended entries (fsync); refresh config if a config entry moved}
+\Indent{IF m.leaderCommit $>$ commitIndex: commitIndex $\leftarrow$ min(m.leaderCommit, match)}
+\Indent{reply(success=true, matchIndex=m.prevLogIndex + len(m.entries), seq=m.seq)}
+\end{pseudocode}
+
+\begin{keyidea}{The Log Matching Property, and why one check suffices}
+The check ``do we agree on the single entry immediately before the ones I am
+sending'' looks far too weak to guarantee that two whole logs agree. It is not,
+because of an induction: entries are only ever appended by a leader, indexes
+are never reused, and only one leader exists per term. So if two logs contain an
+entry with the same index \emph{and} the same term, that entry was created by
+the same leader in the same term, and therefore all entries before it are also
+identical. Agreement on one entry proves agreement on the entire prefix. That is
+why AppendEntries carries \code{prev\_log\_index} and \code{prev\_log\_term}
+at all, and why the follower's reply is trustworthy.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[x=1cm, y=1cm]
+\foreach \x/\n/\r in {0/n1/{leader}, 6.2/n2/{follower}, 12.4/n3/{follower}} {
+  \node[box, minimum width=20mm] at (\x,9.4) {\n\\\scriptsize\r};
+  \draw[dashed, draw=linegrey, thick] (\x,8.9) -- (\x,-1.9);
+}
+\node[box, minimum width=18mm] at (-3.8,9.4) {Client};
+\draw[dashed, draw=linegrey, thick] (-3.8,8.9) -- (-3.8,-1.9);
+
+\draw[flow] (-3.8,8.3) -- node[lbl, above]{put city=lahore} (0,8.3);
+\node[lbl, anchor=north west, align=left, text width=5.4cm] at (0.3,8.0)
+  {\code{propose()}: append Entry(idx=6, term=2, command)\\
+   to my own log, \textbf{fsync it}, then broadcast};
+
+\draw[flow] (0,6.2) -- node[lbl, above, pos=0.5]
+  {AppendEntries(prevIdx=5, prevTerm=2, entries=[6], leaderCommit=5)} (6.2,6.2);
+\node[lbl, anchor=north west, align=left, text width=4.6cm] at (6.5,6.1)
+  {my term at index 5 is 2:\\\textbf{matches}. Append entry 6,\\\textbf{fsync}};
+
+\draw[flow] (0,5.3) -- node[lbl, below, pos=0.5]{AppendEntries(\dots)} (9.15,5.3);
+\node[font=\Large, text=warnred] at (9.4,5.3) {$\times$};
+\node[lbl, anchor=north, align=center, text width=3.4cm, text=warnred] at (9.4,5.0)
+  {this message is lost\\by the network};
+
+\draw[flow] (6.2,3.4) -- node[lbl, above, pos=0.5]{Reply(success=true, matchIndex=6)} (0,3.4);
+
+\node[lbl, anchor=north west, align=left, text width=7.4cm, text=okgreen] at (0.3,3.1)
+  {matchIndex = \{n2:6, n3:0\}, plus my own 6.\\
+   sorted = [0, 6, 6]; the majority-th value is 6.\\
+   Entry 6 is of MY term (2), so it may commit.\\
+   \textbf{commitIndex = 6}. Apply to the state machine.};
+
+\draw[flow] (0,0.9) -- node[lbl, above, pos=0.5]{reply: OK} (-3.8,0.9);
+\node[lbl, anchor=north west, align=left, text width=7.4cm] at (0.3,0.6)
+  {n3 is still behind, but the client already has its answer:\\a majority is enough.};
+
+\draw[flow] (0,-1.0) -- node[lbl, above, pos=0.5]
+  {next heartbeat: AppendEntries(entries=[6], leaderCommit=6)} (12.4,-1.0);
+\node[lbl, anchor=north west, align=left, text width=3.2cm] at (12.7,-1.2) {n3 catches up here};
+\end{tikzpicture}}
+\caption{The replication path for one write. The client is answered as soon as a
+\emph{majority} has the entry stored durably; the straggler catches up on the
+next heartbeat. Losing n3's message costs nothing, because AppendEntries is
+idempotent and heartbeats retry forever.}
+\label{fig:replication}
+\end{figure}
+
+\subsubsection{Fast backoff on conflict}
+
+When a follower rejects an AppendEntries, the naive repair is for the leader to
+decrement \code{next\_index} by one and try again, costing one full round trip
+per missing entry. A follower 500 entries behind then needs 500 round trips.
+Raft's optimization, implemented here, is for the follower to return a
+\emph{conflict hint}: the first index of the conflicting term. The leader jumps
+straight there.
+
+\begin{lstlisting}[language=Python, caption={raft/node.py: the follower computes the hint by scanning back over its own conflicting term}]
+our_prev_term = self.log.term_at(prev_index)
+if our_prev_term is None or our_prev_term != prev_term:
+    if our_prev_term is None:
+        conflict = self.log.last_index + 1        # our log is simply too short
+    else:
+        conflict = prev_index                     # walk back over the whole bad term
+        while conflict > self.log.snapshot_index + 1 and \
+                self.log.term_at(conflict - 1) == our_prev_term:
+            conflict -= 1
+    self.env.send(msg.leader_id, AppendEntriesReply(
+        term=self.current_term, follower_id=self.id, success=False,
+        match_index=0, conflict_index=conflict, seq=msg.seq))
+    return
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={raft/node.py: and the leader consumes it, but never trusts it upward}]
+else:
+    # Fast backoff using the follower's conflict hint.
+    self.next_index[p] = max(1, min(self.next_index[p] - 1, msg.conflict_index)
+                             if msg.conflict_index else self.next_index[p] - 1)
+    self._send_append(p)
+\end{lstlisting}
+
+The \code{min(next\_index - 1, conflict\_index)} is a defensive detail worth
+noticing in an interview: the hint can only ever move \code{next\_index}
+\emph{down}, never up. A hint from a confused or reordered reply can therefore
+cost an extra round trip but can never skip entries, which would be a
+correctness bug rather than a performance one. The \code{max(1, ...)} floors it
+at the first real index.
+
+\subsection{The commit rule, and the no-op}
+\label{sec:commitrule}
+
+This is the single subtlest rule in Raft, and the README singles it out as one
+of the two places ``where a plausible shortcut is a real linearizability bug''.
+
+\begin{lstlisting}[language=Python, caption={raft/node.py: \_maybe\_advance\_commit, all seven lines of it}]
+def _maybe_advance_commit(self) -> None:
+    if self.role is not Role.LEADER:
+        return
+    matches = sorted(
+        (self.match_index[n] if n != self.id else self.log.last_index)
+        for n in self.config
+    )
+    if not matches:
+        return
+    candidate = matches[len(matches) - self._majority()]
+    if candidate > self.commit_index and self.log.term_at(candidate) == self.current_term:
+        self._set_commit_index(candidate)
+\end{lstlisting}
+
+The first half is a neat trick: sort every node's match index (counting the
+leader's own last index for itself) and take the element at position
+\code{len - majority}. For 3 nodes with matches \code{[0, 6, 6]}, that is index
+\code{3 - 2 = 1}, giving 6: the highest index that a majority has reached. It is
+the median, generalized.
+
+The second half is the subtle part: \code{self.log.term\_at(candidate) ==
+self.current\_term}. A leader may \textbf{not} commit an entry from an earlier
+term merely because it is now replicated on a majority.
+
+\begin{keyidea}{Why counting replicas of an old entry is unsafe (the paper's Figure 8)}
+Suppose an entry from term 2 sits on a majority of nodes but was never
+committed by term 2's leader (which crashed before it could count). A new
+leader in term 4 sees it on a majority and commits it. But a \emph{different}
+node, whose log happens to be more up to date on other grounds, can still win a
+later election, and its log does not contain that entry. It would then
+overwrite it. An entry that was reported committed would vanish. Replication
+count alone is therefore not proof of permanence for old entries.
+
+The fix, and this implementation's version of it: a leader may only directly
+commit entries \textbf{from its own term}. To make progress on the backlog, a
+fresh leader immediately appends a \code{noop} entry of its own term
+(\code{\_become\_leader}, line 212). When that no-op commits by the ordinary
+majority rule, every entry before it commits \emph{transitively}, by the Log
+Matching Property, safely. The no-op is not a nicety; without it a leader that
+receives no writes could never commit its predecessor's backlog at all.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.98\textwidth}{!}{
+\begin{tikzpicture}[x=0.92cm, y=0.92cm]
+\tikzset{cell/.style={draw=inkblue, minimum width=8mm, minimum height=8mm, font=\small, fill=white}}
+\tikzset{cellold/.style={cell, fill=softgrey}}
+\tikzset{cellnew/.style={cell, fill=okgreen!18, draw=okgreen}}
+
+\node[lbl, anchor=east, align=right] at (-0.4,3.0) {\textbf{n1} (new leader, term 2)};
+\foreach \i/\t in {0/1, 1/1, 2/2} {
+  \node[cellold] at (\i,3.0) {\t};
+}
+\node[cellnew] at (3,3.0) {2};
+\node[lbl, below] at (3,2.5) {noop};
+
+\node[lbl, anchor=east, align=right] at (-0.4,1.8) {\textbf{n2}};
+\foreach \i/\t in {0/1, 1/1} { \node[cellold] at (\i,1.8) {\t}; }
+\node[cell, draw=linegrey, fill=white, text=linegrey] at (2,1.8) {?};
+\node[cell, draw=linegrey, fill=white, text=linegrey] at (3,1.8) {?};
+
+\node[lbl, anchor=east, align=right] at (-0.4,0.6) {\textbf{n3}};
+\foreach \i/\t in {0/1, 1/1} { \node[cellold] at (\i,0.6) {\t}; }
+\node[cell, draw=linegrey, fill=white, text=linegrey] at (2,0.6) {?};
+\node[cell, draw=linegrey, fill=white, text=linegrey] at (3,0.6) {?};
+
+\foreach \i in {0,1,2,3} { \node[lbl, above] at (\i,3.5) {idx \the\numexpr\i+1\relax}; }
+
+\node[lbl, anchor=west, align=left, text width=7.6cm, text=warnred] at (4.4,3.1)
+  {\textbf{FORBIDDEN}: n1 may not commit index 3 (term 1... here term 2 but
+   created by the PREVIOUS leader) just because a majority stores it. Old-term
+   entries are not committable by replica count.};
+\node[lbl, anchor=west, align=left, text width=7.6cm, text=okgreen] at (4.4,1.2)
+  {\textbf{ALLOWED}: once the term-2 noop at index 4 reaches a majority, index 4
+   commits by the ordinary rule, and indexes 1 to 3 commit transitively with it,
+   because any log holding entry 4 must hold its whole prefix.};
+\draw[flow, draw=okgreen] (3,2.4) to[out=200, in=90] (2.0,1.0);
+\end{tikzpicture}}
+\caption{The section 5.4.2 commit restriction. The no-op entry is the vehicle
+that safely drags the previous leader's backlog into the committed region.}
+\end{figure}
+
+The test \code{test\_commit\_only\_with\_current\_term\_entry} pins exactly
+this: it force-installs a leader with two term-1 entries, asserts
+\code{commit\_index == 0} immediately (nothing commits before replication),
+runs, and asserts \code{commit\_index == 3}: the no-op at index 3 committed and
+pulled indexes 1 and 2 with it.
+
+\subsection{Persistence and crash safety}
+
+\begin{jargon}{fsync}
+An operating system call that does not return until the data you wrote has
+actually reached durable storage. An ordinary \code{write()} only copies data
+into a kernel buffer in memory; if the power fails a moment later, that data
+never existed. Without \code{fsync}, all of Raft's durability reasoning is
+fiction.
+\end{jargon}
+
+\code{FileStorage} keeps three files per node and uses two different, carefully
+chosen durability techniques:
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[node distance=8mm]
+\node[store, minimum width=32mm, minimum height=16mm] (h) {\code{hardstate.json}\\\scriptsize{}currentTerm, votedFor};
+\node[store, minimum width=32mm, minimum height=16mm, right=16mm of h] (l) {\code{log.bin}\\\scriptsize{}append-only records};
+\node[store, minimum width=32mm, minimum height=16mm, right=16mm of l] (s) {\code{snapshot.json}\\\scriptsize{}state machine image};
+
+\node[extbox, below=9mm of h, minimum width=42mm, align=left] (h2)
+  {\scriptsize \textbf{Technique: atomic replace}\\
+   \scriptsize write .tmp $\rightarrow$ flush $\rightarrow$ fsync file\\
+   \scriptsize $\rightarrow$ rename() $\rightarrow$ fsync the DIRECTORY\\
+   \scriptsize rename is atomic on POSIX: a reader\\
+   \scriptsize sees the whole old file or the whole new one};
+\node[extbox, below=9mm of l, minimum width=42mm, align=left] (l2)
+  {\scriptsize \textbf{Technique: scan and truncate}\\
+   \scriptsize each record = [4B length][4B CRC32][JSON]\\
+   \scriptsize append $\rightarrow$ flush $\rightarrow$ fsync, per batch\\
+   \scriptsize on load: scan; first short or bad-CRC\\
+   \scriptsize record = torn tail $\rightarrow$ truncate from there};
+\node[extbox, below=9mm of s, minimum width=42mm, align=left] (s2)
+  {\scriptsize \textbf{Technique: atomic replace, then rewrite}\\
+   \scriptsize snapshot.json lands atomically, THEN\\
+   \scriptsize log.bin is rewritten with only the suffix.\\
+   \scriptsize Crash in between? On load, entries at or\\
+   \scriptsize below snapshot.last\_index are dropped.};
+\draw[flow] (h) -- (h2);
+\draw[flow] (l) -- (l2);
+\draw[flow] (s) -- (s2);
+\end{tikzpicture}}
+\caption{The three on-disk structures and their recovery strategies. Each is
+either atomic-rename recoverable or scan-and-truncate recoverable, which is the
+project's stated one-line discipline for crash safety.}
+\end{figure}
+
+\begin{keyidea}{Why a torn tail is always safe to discard}
+A crash mid-append can leave half a record on disk. Recovery finds the bad
+CRC32 checksum and truncates from that point. This throws away data, which
+sounds alarming, and is provably fine: Raft never acknowledges anything before
+\code{fsync} returns, so a record that was still being written was, by
+definition, never acknowledged to anybody. Nobody was told it existed, so
+nobody can be surprised that it does not. Discipline (never acknowledge before
+fsync) is what makes a destructive recovery correct.
+\end{keyidea}
+
+The scan is genuinely as small as the README claims. This is all of it:
+
+\begin{lstlisting}[language=Python, caption={raft/storage.py: torn-tail recovery, the whole mechanism}]
+while pos + _REC_HEADER.size <= len(raw):
+    length, crc = _REC_HEADER.unpack_from(raw, pos)
+    start = pos + _REC_HEADER.size
+    payload = raw[start:start + length]
+    if len(payload) < length or zlib.crc32(payload) != crc:
+        break  # torn tail from a crash mid-write
+    entries.append(Entry.from_dict(json.loads(payload)))
+    pos = start + length
+    good_end = pos
+if good_end < len(raw):
+    # Discard the torn tail so future appends start from a clean point.
+    self._log_fh.close()
+    with open(self._logf, "r+b") as f:
+        f.truncate(good_end)
+        f.flush()
+        os.fsync(f.fileno())
+    self._log_fh = open(self._logf, "ab")
+\end{lstlisting}
+
+Note the detail in \code{\_atomic\_write}: after \code{os.rename}, the code
+opens the containing \emph{directory} and fsyncs that too. Renaming is atomic,
+but the directory entry recording the rename is itself buffered; without the
+directory fsync, a power cut can leave the file at its old name. This is a
+classic mistake, and it is not made here.
+
+Two tests drive these paths directly rather than by inspection:
+
+\begin{itemize}
+\item \code{test\_crash\_mid\_write\_discards\_torn\_tail}\\
+      writes a valid record header promising 500 bytes and then supplies 11,
+      then asserts both that the surviving entries are exactly
+      \code{[1, 2, 3]} and that the file was physically truncated back to its
+      previous size.
+\item \code{test\_corrupt\_record\_stops\_scan}\\
+      flips a single bit inside the last record's payload and asserts the CRC
+      rejects it.
+\end{itemize}
+
+\subsection{Snapshots and log compaction}
+
+An append-only log grows forever. Compaction replaces a prefix of the log with
+a single image of the state that prefix produced.
+
+\begin{jargon}{Snapshot}
+A serialized copy of the entire state machine at a particular log index, plus
+the metadata needed to keep the log arithmetic consistent:
+\code{last\_included\_index}, \code{last\_included\_term}, and the cluster
+config as of that point. Here the payload is \code{KVMachine.snapshot()}: a
+JSON blob of the data dictionary \emph{and} the session table.
+\end{jargon}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.95\textwidth}{!}{
+\begin{tikzpicture}[x=0.85cm, y=0.85cm]
+\tikzset{cell/.style={draw=inkblue, minimum width=7.5mm, minimum height=7.5mm, font=\scriptsize, fill=white}}
+\node[lbl, anchor=east] at (-0.5,2.2) {before:};
+\foreach \i in {0,...,9} { \node[cell, fill=softgrey] at (\i,2.2) {\the\numexpr\i+1\relax}; }
+\foreach \i in {10,11} { \node[cell] at (\i,2.2) {\the\numexpr\i+1\relax}; }
+\draw[decorate, decoration={brace, amplitude=4pt}, draw=accent]
+  (-0.42,2.65) -- (9.42,2.65) node[midway, above=3pt, lbl, text=accent]{applied prefix: replaceable};
+
+\node[lbl, anchor=east] at (-0.5,0.2) {after:};
+\node[store, minimum width=42mm, minimum height=8mm] at (2.3,0.2)
+  {\scriptsize snapshot: lastIndex=10, lastTerm=6, config, KV data + sessions};
+\foreach \i in {10,11} { \node[cell] at (\i,0.2) {\the\numexpr\i+1\relax}; }
+\draw[flow] (4.7,1.7) -- (4.7,0.75);
+\node[lbl, anchor=west, align=left, text width=5.4cm] at (12.4,1.2)
+  {\code{log.compact\_to(10, 6)}\\then\\\code{storage.save\_snapshot(...)}};
+\end{tikzpicture}}
+\caption{Compaction. \code{RaftLog} keeps \code{snapshot\_index} as an offset,
+so index arithmetic on the surviving entries stays correct: \code{entry(i)}
+resolves to \code{entries[i - snapshot\_index - 1]}.}
+\end{figure}
+
+The trigger is in \code{\_maybe\_snapshot}, called after every apply:
+
+\begin{lstlisting}[language=Python]
+if self.last_applied - self.log.snapshot_index < self.snapshot_threshold:
+    return
+\end{lstlisting}
+
+Above the threshold (1000 entries in production, 40 in the simulator, 10 in the
+snapshot tests) it takes an image and compacts.
+
+The complication compaction creates is that a leader may no longer possess the
+entries a lagging follower needs, because it deleted them. \code{\_send\_append}
+detects this in its first two lines and switches protocol:
+
+\begin{lstlisting}[language=Python, caption={raft/node.py: the fork between replication and snapshot transfer}]
+def _send_append(self, p: str) -> None:
+    ni = self.next_index[p]
+    if ni <= self.log.snapshot_index:
+        snap = self._load_snapshot()
+        self.env.send(p, InstallSnapshot(
+            term=self.current_term, leader_id=self.id,
+            last_included_index=snap.last_index,
+            last_included_term=snap.last_term,
+            config=tuple(snap.config), data=snap.data))
+        return
+    prev_term = self.log.term_at(ni - 1)
+    assert prev_term is not None
+    entries = tuple(self.log.slice_from(ni))
+    self.env.send(p, AppendEntries(...))
+\end{lstlisting}
+
+On the receiving side, \code{\_on\_install\_snapshot} contains a nice piece of
+care. If the follower's own log already contains an entry at
+\code{last\_included\_index} \emph{with the matching term}, the snapshot is
+merely a prefix of what it already has, so it compacts and keeps its suffix.
+Only if the terms disagree does it discard its log wholesale:
+
+\begin{lstlisting}[language=Python, caption={raft/node.py: keep the suffix when the snapshot is only a prefix of what we hold}]
+if self.log.term_at(msg.last_included_index) == msg.last_included_term:
+    # Our log already extends past the snapshot; keep the suffix.
+    self.log.compact_to(msg.last_included_index, msg.last_included_term)
+else:
+    self.log = RaftLog(msg.last_included_index, msg.last_included_term)
+\end{lstlisting}
+
+\begin{honest}{Snapshots are read from disk and shipped whole, on every send}
+\code{\_load\_snapshot()} is literally \code{return self.storage.load().snapshot}.
+For \code{FileStorage} that re-reads and re-parses \code{snapshot.json} from
+disk \textbf{every single time} a snapshot is sent, and \code{load()} also
+re-reads and re-parses the entire \code{log.bin} while it is there, discarding
+the result. It is then sent as one message with no chunking, so a large state
+machine means a single enormous frame (bounded only by \code{MAX\_FRAME}, 64
+MB). At three nodes and a demo-sized dataset this is invisible; at any real
+scale it is the first thing that would fall over. The README lists the chunked
+transfer and cached handle as known future work, which is honest, but the
+severity is easy to understate: the cost here is not just ``re-reads the
+snapshot'', it is ``re-reads and re-parses the entire log too''.
+\end{honest}
+
+\subsection{Membership changes}
+
+Changing the cluster from \{n1, n2, n3\} to \{n1, n2, n3, n4\} is dangerous for
+a reason that is easy to miss: during the switch, different nodes believe in
+different configurations, and if the old and new majorities do not overlap, two
+leaders can be elected simultaneously without either breaking any rule.
+
+\begin{keyidea}{Why single-server changes are safe without a two-phase protocol}
+Add or remove exactly \textbf{one} server per config entry. Any two
+configurations differing by one server must share a common majority: a majority
+of \{n1,n2,n3\} is 2, a majority of \{n1,n2,n3,n4\} is 3, and any 2-of-3 and
+any 3-of-4 drawn from these overlapping sets must intersect. So the disjoint
+quorums that cause dual leadership cannot form, and no special ``joint'' state
+is needed. Ongaro's dissertation's alternative, \emph{joint consensus}, allows
+arbitrary jumps but costs a two-phase protocol and a state where both old and
+new majorities must agree. \file{docs/ARCHITECTURE.md} states the tradeoff and
+the choice explicitly.
+\end{keyidea}
+
+The implementation is a plain log entry of kind \code{config} plus exactly two
+extra rules:
+
+\begin{enumerate}
+\item \textbf{One at a time.} \code{\_config\_change\_pending()} scans the
+      uncommitted tail for any config entry and raises
+      \code{ConfigChangeInProgress} if one is there.
+\item \textbf{Effective on append, not on commit.} \code{\_refresh\_config()}
+      runs the moment a config entry is appended or truncated. This is
+      counter-intuitive (acting on data that might still be rolled back) but is
+      the dissertation's rule, and it is necessary: a node must count itself
+      out of a cluster it has been removed from immediately, or it can disrupt
+      the very commit that removes it.
+\end{enumerate}
+
+Leader self-removal is handled at the end of \code{\_apply\_committed}: the
+leader keeps leading until the config entry that removes it \emph{commits}, and
+only then steps down, so it can shepherd its own removal to completion.
+
+\begin{lstlisting}[language=Python, caption={raft/node.py: a leader that has been removed from the config steps down, but only on apply}]
+if entry.kind == "config" and self.role is Role.LEADER and \
+        self.id not in tuple(entry.data["nodes"]):
+    self._step_down(self.current_term)
+\end{lstlisting}
+
+A joining node is started with an empty \code{initial\_config}. Because
+\code{\_on\_election\_timeout} returns early when \code{self.id not in
+self.config}, and an empty config contains nothing, a joiner never campaigns.
+It sits silent until the leader's AppendEntries or InstallSnapshot teaches it
+the cluster it belongs to. This is elegant: one guard clause implements
+``joining nodes must not disrupt the cluster''.
+
+\begin{honest}{A real dead end: \_config\_from's entries\_last\_index filter}
+\code{\_config\_from(entries\_last\_index)} filters entries above a bound, but
+the only caller that passes a bound is \code{\_maybe\_snapshot}, and it passes
+\code{self.last\_applied}, which by construction is a prefix of the log at that
+moment. The other caller, \code{\_latest\_config}, passes \code{None}. The
+filter is therefore correct but currently near-vacuous. Not a bug; worth knowing
+before an interviewer asks what it defends against.
+\end{honest}
+
+\begin{honest}{An inconsistency between two nearly identical lines}
+\code{\_become\_leader} initializes \code{next\_index} to
+\code{self.log.last\_index + 1}. \code{\_change\_config} initializes newly
+appearing peers to \code{self.log.last\_index} (no \code{+ 1}), while
+\code{\_refresh\_config} uses \code{last\_index + 1} again. The \code{+ 1} is
+the paper's value. The odd one out in \code{\_change\_config} is off by one and
+means the leader will send the new server one entry it need not have sent (the
+config entry itself, which it does not have anyway, so the follower rejects and
+the conflict hint repairs it in one extra round trip). It is self-correcting
+and therefore invisible in the tests, but the three lines should agree, and an
+interviewer reading these three functions side by side will notice.
+\end{honest}
+
+% =====================================================================
+\section{Linearizable reads: the ReadIndex protocol}
+
+Writes go through the log, so they are safe by construction. Reads are the trap.
+
+\begin{keyidea}{Why reading from the leader's memory is wrong}
+``I am the leader, so I will just answer from my local copy'' is unsafe,
+because \textbf{a leader cannot know it is still the leader}. Suppose n1 is
+partitioned away from n2 and n3. Those two elect n3 in a new term and accept
+writes. n1 has heard nothing, so it still believes it is leader, its local data
+looks perfectly fine to it, and it will happily serve a value that is now
+minutes out of date. Nothing about its own state betrays it. Leadership is not
+a local fact.
+\end{keyidea}
+
+The fix is to make the leader \emph{prove} its currency to a majority before
+answering, which is the ReadIndex protocol:
+
+\begin{pseudocode}{ReadIndex (\code{read\_index} + \code{\_check\_pending\_reads})}
+\Step{ON read\_index(callback):}
+\Indent{IF not leader: callback(None); RETURN \quad // caller must redirect}
+\Indent{// 1. A fresh leader must first commit an entry of its OWN term.}
+\Indent{readIdx $\leftarrow$ commitIndex IF an entry of my term has committed ELSE none}
+\Indent{// 2. Record the current heartbeat round number and broadcast it.}
+\Indent{hbSeq $\leftarrow$ hbSeq + 1}
+\Indent{pendingReads.append(PendingRead(seq=hbSeq, readIndex=readIdx, cb=callback))}
+\Indent{send AppendEntries(seq=hbSeq) to every peer}
+\Step{}
+\Step{ON any AppendEntriesReply(seq=s) from peer p:  ackSeq[p] $\leftarrow$ max(ackSeq[p], s)}
+\Step{}
+\Step{CHECK pending reads (after every reply, every commit, every broadcast):}
+\Indent{FOR each pending read r with r.readIndex != none:}
+\Indent{\quad acks $\leftarrow$ count of nodes n where n == me OR ackSeq[n] $\geq$ r.seq}
+\Indent{\quad IF acks $\geq$ majority AND lastApplied $\geq$ r.readIndex:}
+\Indent{\quad\quad remove r; r.cb(r.readIndex) \quad // NOW reading local state is safe}
+\Step{}
+\Step{ON step down (any cause): FOR each pending read r: r.cb(none) \quad // fail them all}
+\end{pseudocode}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[x=1cm, y=1cm]
+% partition backdrop
+\fill[warnred!7, rounded corners=3pt] (-3.1,-1.6) rectangle (2.0,8.5);
+\fill[okgreen!7, rounded corners=3pt] (2.6,-1.6) rectangle (12.8,8.5);
+\node[lbl, text=warnred, anchor=north west, align=left] at (-3.0,8.35)
+  {\textbf{MINORITY SIDE} (1 of 3)\\cannot act};
+\node[lbl, text=okgreen, anchor=north east, align=right] at (12.7,8.35)
+  {\textbf{MAJORITY SIDE} (2 of 3): makes progress};
+
+\draw[ultra thick, dashed, draw=warnred] (2.3,-1.6) -- (2.3,7.6);
+\node[lbl, text=warnred, rotate=90, fill=white, inner sep=3pt] at (2.3,8.1)
+  {\textbf{NETWORK PARTITION}};
+
+% lifelines
+\foreach \x/\n/\r in {0/n1/{was leader, term 5}, 4.6/n2/{follower}, 9.2/n3/{follower}} {
+  \node[box, minimum width=22mm] at (\x,7.0) {\n\\\scriptsize\r};
+  \draw[dashed, draw=linegrey, thick] (\x,6.5) -- (\x,-1.3);
+}
+\node[box, minimum width=20mm] at (-2.4,7.0) {Client};
+\draw[dashed, draw=linegrey, thick] (-2.4,6.5) -- (-2.4,-1.3);
+
+\draw[flow] (-2.4,5.9) -- node[lbl, above]{get city} (0,5.7);
+\node[lbl, anchor=west, align=left, text width=2.4cm] at (0.3,5.2)
+  {I am leader.\\readIdx = 42\\hbSeq = 7};
+
+\draw[flow, draw=warnred] (0,4.2) -- node[lbl, above, pos=0.42]{AppendEntries(seq=7)} (2.05,4.2);
+\node[font=\Large, text=warnred] at (2.3,4.2) {$\times$};
+\node[lbl, anchor=west, text=warnred] at (2.6,4.2) {dropped by the partition};
+
+\node[lbl, anchor=west, align=left, text width=7.0cm, text=okgreen] at (4.9,5.9)
+  {\textbf{Meanwhile, on the majority side:} n2 and n3 time out,\\
+   elect n3 in term 6, and commit new writes.\\
+   The value of city is now 'karachi'.};
+\draw[flow, draw=okgreen] (9.2,4.8) -- node[lbl, above]{AppendEntries(term=6)} (4.6,4.8);
+
+\node[lbl, anchor=west, align=left, text width=2.6cm, text=warnred] at (0.3,2.7)
+  {acks for seq 7\\= 1 (just me)\\1 $<$ majority(2)};
+\filldraw[warnred] (0,2.7) circle (2.5pt);
+\node[lbl, anchor=west, align=left, text width=2.6cm, text=warnred] at (0.3,1.4)
+  {\textbf{the read never}\\\textbf{completes}};
+
+\node[lbl, anchor=north west, align=left, text width=9.4cm] at (3.0,1.2)
+  {When the partition heals, n1 sees term 6 $>$ 5 and calls \code{\_step\_down},
+   which fails every pending read with \code{cb(None)}. The client is told
+   \code{not\_leader}, retries at n3, and reads 'karachi'.\\
+   \textbf{The stale value was never served.}};
+\end{tikzpicture}}
+\caption{A network partition, and why ReadIndex is safe. The deposed leader is
+not merely unlikely to answer; it is structurally unable to, because the acks it
+needs cannot cross the partition. Its own state gives it no clue that anything
+is wrong, which is exactly why local state must never be trusted.}
+\label{fig:partition}
+\end{figure}
+
+\begin{keyidea}{The second precondition: a fresh leader must commit its own term first}
+The README calls this out as the bug the chaos harness found. A newly elected
+leader's \code{commit\_index} is a stale local variable: it reflects what
+\emph{it} knew before the election, and \emph{may be lower than what is actually
+committed cluster-wide}, because commit index is not transferred during
+elections. Capturing \code{readIndex = commitIndex} at that moment could
+therefore serve a read that misses a committed write, which is a real
+linearizability violation.
+
+The implementation handles this without stalling: a read that arrives too early
+is registered with \code{read\_index = None}, and \code{\_set\_commit\_index}
+assigns it the moment the first entry of the leader's own term (the no-op)
+commits:
+\end{keyidea}
+
+\begin{lstlisting}[language=Python, caption={raft/node.py: pending reads get their index the instant the term's first entry commits}]
+if self.role is Role.LEADER and self._term_commit_index is None and \
+        self.log.term_at(index) == self.current_term:
+    self._term_commit_index = index
+    for r in self._pending_reads:
+        if r.read_index is None:
+            r.read_index = self.commit_index
+\end{lstlisting}
+
+\code{docs/ARCHITECTURE.md} also documents the alternative that was rejected:
+\emph{leader leases}, which let a leader serve reads for
+\code{election\_timeout - clock\_drift} after a heartbeat quorum, saving the
+per-read round trip. The stated reason for refusing it is exact and worth
+repeating in an interview: leases buy latency at the price of a safety argument
+that depends on \textbf{bounded clock drift between physical machines}. In a
+project whose entire thesis is testable correctness, importing an untestable
+assumption about hardware clocks would be self-defeating. ReadIndex costs one
+heartbeat round and assumes nothing about clocks.
+
+A pleasing efficiency: the heartbeat round is shared. Concurrent reads
+piggyback on \code{\_hb\_seq} windows, and \code{\_ack\_seq[p]} is monotone
+(\code{max(...)}), so an ack for round 9 automatically satisfies a read waiting
+on round 7.
+
+% =====================================================================
+\section{The KV state machine and exactly-once writes}
+
+\file{kv/machine.py} is 72 lines and is the deterministic program from the
+replicated state machine definition. Four operations:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Op} & \textbf{Effect} & \textbf{Result dict} \\
+\midrule
+\code{put} & \code{data[key] = value} & \code{\{ok: True\}} \\
+\code{delete} & remove key & \code{\{ok: True, existed: bool\}} \\
+\code{cas} & set only if current value == expected & \code{\{ok, swapped: bool, value: old\}} \\
+\code{get} & never in the log; via ReadIndex & \code{\{value\}} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{jargon}{Compare-and-swap (cas)}
+``Set \code{key} to \code{new}, but only if it currently holds \code{expected}.''
+It is the primitive that makes safe concurrent updates possible without locks:
+a client can read a value, compute a new one, and cas it, and the cas fails
+harmlessly if anybody else changed the key in between. In this codebase, a cas
+with \code{expected=None} means ``only if the key is absent'', and a cas with
+\code{value=None} means ``delete if it currently equals expected''.
+\end{jargon}
+
+\subsection{The exactly-once problem}
+
+\begin{keyidea}{Why retries silently corrupt data, and why the fix must live in the state machine}
+A client sends \code{cas team: raptors $\rightarrow$ dinos}. The leader commits it,
+then dies before the reply is sent. The client times out and retries against
+the new leader. The new leader has no idea this is a retry: it applies the cas
+a second time. Now the value is \code{raptors}... no: the value is already
+\code{dinos}, so the second cas \emph{fails}, and the client is told its
+operation failed when in fact it succeeded. For a non-idempotent operation like
+``increment'', a retry would double-apply outright.
+
+The fix: every write carries \code{(client\_id, seq)}. The state machine keeps,
+per client, the last seq it applied and the \emph{result it returned}. A
+duplicate returns the cached result without re-executing.
+
+The part that is easy to get wrong: this table must live \textbf{inside the
+replicated state}, replicated through the log and included in snapshots. If it
+were a leader-local cache, failover would silently downgrade the system from
+exactly-once to at-least-once, precisely when it matters most, because the new
+leader would have no memory of what the old one had already done.
+\end{keyidea}
+
+\begin{lstlisting}[language=Python, caption={kv/machine.py: the entire dedup mechanism, at the top of apply()}]
+def apply(self, entry: Entry) -> Result:
+    cmd = entry.data
+    client, seq = cmd.get("client"), cmd.get("seq")
+    if client is not None and seq is not None:
+        cached = self.sessions.get(client)
+        if cached is not None and seq <= cached[0]:
+            return cached[1]          # duplicate: original result, no re-execution
+    result = self._execute(cmd)
+    if client is not None and seq is not None:
+        self.sessions[client] = (seq, result)
+    return result
+\end{lstlisting}
+
+And the snapshot carries it, which is the point:
+
+\begin{lstlisting}[language=Python, caption={kv/machine.py: sessions ride inside the snapshot, not beside it}]
+def snapshot(self) -> str:
+    return json.dumps({"data": self.data, "sessions": self.sessions})
+\end{lstlisting}
+
+\code{test\_exactly\_once\_across\_leader\_failover} drives exactly the scenario
+above: commit a cas, crash the leader before the client hears back, retry the
+identical \code{(client, seq)} on the new leader, and assert the retry returns
+\code{swapped: True} (the \emph{cached original} outcome, not the correct-but-wrong
+answer a fresh evaluation would give) and that the value was applied once.
+
+\begin{honest}{The dedup rule is \code{seq <= cached[0]}, which is stricter than it looks}
+Because the check is ``less than or equal to the highest seq I have seen'', a
+write that arrives with an \emph{older} seq than one already applied is
+silently discarded as a duplicate, returning the newer operation's cached
+result. That is correct only if each client's seqs are strictly monotonic. The
+README describes this biting the project's own test harness: a helper issued
+writes with random seq numbers, they were correctly discarded, and two
+unrelated tests failed mysteriously. The lesson was baked into \code{client.py}
+(\code{self.\_seq = itertools.count(1)}) and into the simulator's client (which
+uses the globally monotonic \code{op.op\_id} as its seq). It is worth being
+clear about the shape of the contract: \textbf{the correctness of the dedup
+table is a constraint imposed on every client, enforced nowhere in the server}.
+A client library with a bug here corrupts its own results and nothing detects
+it.
+\end{honest}
+
+\begin{honest}{Sessions never expire, and the leak is unbounded in the wrong dimension}
+\code{self.sessions[client] = (seq, result)} is never removed. The README lists
+this. What the README does not spell out is that the table is not just a memory
+leak in RAM: it is part of every snapshot, so it is written to disk, shipped
+over the network in full on every InstallSnapshot, and grows with the number of
+\emph{distinct client ids ever seen}. \code{RaftClient} generates a fresh random
+\code{cli-<uuid>} per instance by default, and the CLI constructs a new client
+per command, so \textbf{every single \code{raftkv put} from the command line
+permanently adds a row}. The dissertation's fix (a session TTL agreed through
+the log) is correctly identified as the prerequisite for calling this
+production-ready.
+\end{honest}
+
+% =====================================================================
+\section{The transports}
+
+\subsection{Real TCP}
+
+\begin{jargon}{Length-prefixed framing}
+TCP is a stream of bytes with no message boundaries: send two 100-byte messages
+and the receiver may get 200 bytes at once, or 3 then 197. So every message is
+prefixed with its length (here 4 bytes, big-endian), and the reader reads
+exactly 4 bytes, decodes the length, then reads exactly that many. This
+codebase uses \code{readexactly()} for both, which is the correct primitive.
+\end{jargon}
+
+Design notes worth defending:
+
+\begin{itemize}
+\item \textbf{One port for peer and client traffic}, distinguished by a
+      \code{kind} field in the frame (\code{"hello"}, \code{"raft"}, or
+      anything else meaning a client request).
+\item \textbf{Peer sends are deliberately lossy.} Each peer has a bounded
+      \code{asyncio.Queue(maxsize=256)} drained by a dedicated writer task
+      that reconnects on failure. If the queue is full,
+      \code{except asyncio.QueueFull: pass}, and the message is dropped without
+      comment. This looks like a bug and is a design decision: Raft already
+      assumes a lossy network and retransmits on the next heartbeat, so
+      dropping is strictly better than growing an unbounded queue of stale
+      messages that will be obsolete by the time they are sent.
+\end{itemize}
+
+\begin{keyidea}{The Python 3.12 shutdown deadlock (a real bug, worth telling)}
+Python 3.12 changed \code{asyncio.Server.wait\_closed()} to also wait for
+in-flight connection \emph{handlers}, not just the listening socket. Every
+client connection in this design sits parked in \code{readexactly}, waiting
+forever for a next request that will never come. So \code{wait\_closed()} never
+returned: the TCP integration test hung for minutes at approximately zero CPU,
+which is the signature of a deadlock rather than a slow loop. The fix is the
+\code{self.\_conns} set: track every accepted \code{StreamWriter} and close
+them all \emph{before} awaiting \code{wait\_closed()}, so the parked handlers
+get an EOF, return, and let the server finish closing.
+\end{keyidea}
+
+\subsection{The simulated network}
+
+\code{SimNetwork} implements the same send/deliver contract over the virtual
+clock, with four seeded faults. The whole of \code{send} is:
+
+\begin{lstlisting}[language=Python, caption={sim/network.py: every fault, in nine lines}]
+def send(self, src: str, dest: str, msg: Message) -> None:
+    self.messages_sent += 1
+    if self.rng.random() < self.drop_prob:          # 1. loss
+        self.messages_dropped += 1
+        return
+    copies = 2 if self.rng.random() < self.dup_prob else 1   # 2. duplication
+    for _ in range(copies):
+        delay = self.rng.uniform(self.min_delay, self.max_delay)  # 3. reordering, via delay
+        self.clock.call_later(delay, lambda: self._deliver(src, dest, msg))
+
+def _deliver(self, src: str, dest: str, msg: Message) -> None:
+    handler = self._handlers.get(dest)
+    if handler is None or self.is_partitioned(src, dest):   # 4. partition, at DELIVERY time
+        self.messages_dropped += 1
+        return
+    handler(src, msg)
+\end{lstlisting}
+
+\begin{keyidea}{Why partitions are checked at delivery, not at send}
+Because that is what a real network does. If a partition forms while a message
+is in flight, the message dies in transit; the TCP connection carrying it
+resets. Checking at send time would model a network that politely refuses to
+accept doomed messages, which no network does, and would miss the entire class
+of bugs where a message crosses a boundary that closed behind it. Independent
+random delay per copy also means duplicates arrive out of order, for free.
+\end{keyidea}
+
+\code{SimEnv} adds two things the real \code{AsyncioEnv} does not need:
+
+\begin{itemize}
+\item \textbf{\code{timer\_scale}}, multiplying every scheduled delay, which
+      models clock skew. A node with scale 0.5 fires its election timers twice
+      as fast as everyone else; the nemesis rolls scales in [0.5, 1.8].
+\item \textbf{\code{kill()} and the epoch guard.} A simulated crash must
+      invalidate every callback the dead node scheduled, including any already
+      sitting on the shared heap. Every callback is wrapped in a closure that
+      compares the epoch it was created in against the current one and silently
+      does nothing if they differ. This is how ``the process died'' is modelled
+      without unwinding the heap.
+\end{itemize}
+
+\begin{lstlisting}[language=Python, caption={sim/network.py: the epoch guard, i.e. how a node stops existing}]
+def call_later(self, delay: float, fn: Callable[[], None]) -> SimTimer:
+    epoch = self._epoch
+    def guarded() -> None:
+        if epoch == self._epoch:
+            fn()
+    t = self.clock.call_later(delay * self.timer_scale, guarded)
+    ...
+def kill(self) -> None:
+    """Invalidate all outstanding timers (simulated crash)."""
+    self._epoch += 1
+    ...
+\end{lstlisting}
+
+% =====================================================================
+\section{The deterministic simulator}
+
+\subsection{The virtual clock}
+
+\code{SimClock} is 57 lines and is the beating heart of the determinism claim.
+One binary heap of events, ordered by \code{(when, seq)}. \code{step()} pops the
+earliest, jumps \code{now} to its timestamp, and runs it.
+
+\begin{keyidea}{Why the tie-break on a sequence number is load-bearing}
+Two events scheduled for the same virtual instant must still run in a defined
+order, or determinism dies. \code{SimTimer.\_\_lt\_\_} compares
+\code{(self.when, self.seq)}, and \code{seq} is a monotonically increasing
+counter assigned at scheduling time. Without it, Python's heap would break ties
+by whatever happened to be in the array, and the same seed could produce two
+different runs. The README describes exactly this class of bug: two accidental
+uses of ambient ordering, caught by a test that runs a seed twice and compares
+full history fingerprints.
+\end{keyidea}
+
+And because time is a variable rather than a thing you wait for, ``12 virtual
+seconds of a 3-node cluster'' costs roughly 0.1 real seconds. There is no
+\code{sleep} anywhere in the simulator. That single fact is what converts
+``test the distributed system'' from an overnight job into a function call.
+
+\subsection{One simulation run}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[node distance=7mm]
+\node[box, minimum width=26mm] (seed) {\textbf{seed} (one int)};
+\node[dec, right=12mm of seed, minimum width=16mm] (root) {root\\Random};
+\draw[flow] (seed) -- (root);
+
+\node[extbox, above right=16mm and 14mm of root, minimum width=30mm] (r1) {network rng\\\scriptsize{}delay, loss, dup};
+\node[extbox, right=14mm of root, minimum width=30mm, yshift=6mm] (r2) {cluster rng\\\scriptsize{}$\rightarrow$ per-node env rngs\\\scriptsize{}(election jitter)};
+\node[extbox, right=14mm of root, minimum width=30mm, yshift=-8mm] (r3) {nemesis rng\\\scriptsize{}what fault, when, to whom};
+\node[extbox, below right=16mm and 14mm of root, minimum width=30mm] (r4) {3 x client rng\\\scriptsize{}which key, op, retry timing};
+\draw[dflow] (root) -- (r1); \draw[dflow] (root) -- (r2);
+\draw[dflow] (root) -- (r3); \draw[dflow] (root) -- (r4);
+
+\node[box, minimum width=32mm, minimum height=30mm, right=16mm of r2, yshift=-6mm] (heap)
+  {\textbf{SimClock}\\one heap ordered\\by (time, seq)\\\scriptsize{}timers, deliveries,\\\scriptsize{}client actions, faults};
+\draw[flow] (r1) -- (heap); \draw[flow] (r2) -- (heap);
+\draw[flow] (r3) -- (heap); \draw[flow] (r4) -- (heap);
+
+\node[box, minimum width=30mm, right=14mm of heap, yshift=10mm] (nodes) {3 x RaftNode\\\scriptsize{}the real thing};
+\node[box, minimum width=30mm, right=14mm of heap, yshift=-10mm] (mon) {Monitor\\\scriptsize{}4 invariants,\\\scriptsize{}checked live};
+\draw[flow] (heap) -- (nodes);
+\draw[flow] (nodes) -- node[lbl, right]{trace events} (mon);
+
+\node[store, minimum width=28mm, below=12mm of heap] (hist) {HistoryRecorder\\\scriptsize{}every invoke/complete};
+\draw[flow] (r4) to[out=280, in=180] (hist);
+\node[box, minimum width=30mm, right=14mm of hist] (chk) {Linearizability\\checker};
+\draw[flow] (hist) -- node[lbl, above]{at the end} (chk);
+\node[box, minimum width=24mm, right=12mm of chk] (out) {PASS / FAIL\\\scriptsize{}with the seed};
+\draw[flow] (chk) -- (out);
+\draw[flow] (mon) to[out=0, in=60] (out);
+\end{tikzpicture}}
+\caption{One seeded run. The seed fans out into six independent generators, all
+events funnel through one ordered heap, and two independent oracles (the live
+invariant Monitor and the post-hoc linearizability checker) judge the result.
+Nothing anywhere consults a wall clock or the global \code{random} module.}
+\end{figure}
+
+The default \code{SimConfig}: 3 nodes, 12 virtual seconds, 3 concurrent
+clients, 3 keys, 5\% message loss, 5\% duplication, 1 to 30 ms delay, a nemesis
+action every 1.5 virtual seconds on average, snapshot threshold 40 (chosen low,
+so that compaction and InstallSnapshot actually happen within 12 seconds rather
+than being theoretically reachable).
+
+Three keys and three clients is a deliberate, well-judged choice: it maximizes
+\emph{contention} (many operations racing on the same key) while keeping the
+per-key history narrow enough for the checker's exponential search to finish.
+A thousand keys would produce more operations and test far less.
+
+\subsection{The nemesis}
+
+\begin{jargon}{Nemesis}
+The component whose job is to break things: the adversary. The term comes from
+Jepsen, the best-known distributed-systems testing tool.
+\end{jargon}
+
+Faults fire at exponentially distributed intervals (\code{rng.expovariate}),
+which models a Poisson process, i.e. events that arrive independently at a
+constant average rate. The action is chosen by one roll:
+
+\begin{center}
+\begin{tabular}{llp{7.4cm}}
+\toprule
+\textbf{Prob} & \textbf{Action} & \textbf{What it does} \\
+\midrule
+0.35 & partition & heal everything, then shuffle the nodes and cut at a random point, so any bisection is possible \\
+0.25 & crash & pick a live node, destroy it (volatile state gone, \code{MemoryStorage} kept, modelling an fsync'd disk), restart it after 0.3 to 2.0 virtual seconds \\
+0.15 & skew & set a random node's \code{timer\_scale} to a value in [0.5, 1.8] \\
+0.25 & heal & clear all partitions \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two details that make the harness honest rather than merely violent:
+
+\begin{itemize}
+\item \code{if len(alive) > 1} before crashing: at least one node always
+      survives. A cluster where everything is dead is not a test.
+\item Chaos stops at 70\% of the run (\code{chaos\_deadline}), and
+      \code{\_stabilize()} heals the network, restarts every node, and resets
+      every clock skew. Clients then have a calm window (plus a 3-second drain
+      after the nominal duration) to finish their in-flight retries.
+\end{itemize}
+
+\begin{keyidea}{Why the stabilize window is not cheating}
+Without it, the run would end mid-chaos and most operations would be left
+incomplete. Incomplete operations are the \emph{easiest} thing for a
+linearizability checker to accept, because it can always declare that they
+never happened. A harness that ends in chaos would therefore look clean while
+testing very little. Stabilizing forces operations to actually complete with
+real observed results, which is what gives the checker something to refute. It
+is the opposite of cheating: it is what makes the check bite.
+\end{keyidea}
+
+\subsection{The four invariants, checked live}
+
+\code{RaftNode} exposes an optional \code{trace} callback (\code{None} in
+production, so the cost is one \code{if} per event). The \code{Monitor} hooks
+it and checks four properties continuously, each failure naming the seed:
+
+\begin{enumerate}
+\item \textbf{Election safety}: at most one leader per term. A dict
+      \code{leaders\_by\_term} is kept for the \emph{entire run}, so a second
+      leader for term 5 is caught even if it appears long after the first one
+      is gone. Per-sample checking would miss this.
+\item \textbf{Leader completeness}: the instant any node wins an election, its
+      log is checked against every \code{(index, term)} that any node ever
+      applied. If a new leader is missing a committed entry, the run fails
+      immediately, at the moment of the crime rather than at the eventual
+      symptom.
+\item \textbf{State machine safety}: every applied index and entry pair is
+      recorded globally, in the monitor's \code{applied} dict. Two nodes
+      applying different entries at the same index is an immediate failure.
+      This is the direct detection of divergence.
+\item \textbf{Log matching}: every 200 events, all pairs of live logs are
+      compared: entries with equal index and term must be identical.
+\end{enumerate}
+
+\begin{honest}{Log matching is checked shallowly, and the comment admits it}
+\code{check\_log\_matching} walks each pair of logs downward from the highest
+common index and \code{break}s at the first index where the terms agree,
+commenting ``matching here implies matching below (checked lazily)''. That
+inference is exactly the Log Matching Property, so it is sound \emph{if the
+property holds}, which is what is being tested. The check is therefore
+partially circular: a bug that broke the prefix invariant beneath a
+coincidentally matching entry would not be caught by this check. It would still
+be caught by the state-machine-safety invariant and the linearizability checker,
+so the safety net has other layers, but this specific check is weaker than the
+name suggests.
+\end{honest}
+
+\subsection{The canary: testing the test}
+\label{sec:canary}
+
+\begin{keyidea}{A safety net that never fires is indistinguishable from one that cannot fire}
+This is the single best idea in the test suite.
+\code{test\_broken\_raft\_is\_caught} uses \code{monkeypatch} to replace
+\code{RaftNode.\_majority} with \code{max(1, len(config) // 2)}, that is, it
+deliberately breaks the quorum rule so split brain becomes possible. It then
+asserts that sweeping at most 40 seeds detects an invariant violation, and that
+the message names the seed. If the harness could not catch a cluster with the
+majority rule removed, every green run it ever produced would be worthless.
+\end{keyidea}
+
+\begin{lstlisting}[language=Python, caption={tests/test\_sim\_invariants.py: sabotage the algorithm, demand the harness notices}]
+def test_broken_raft_is_caught(monkeypatch) -> None:
+    monkeypatch.setattr(RaftNode, "_majority",
+                        lambda self: max(1, len(self.config) // 2))
+    caught = None
+    for seed in range(40):
+        try:
+            run_simulation(SimConfig(seed=seed))
+        except InvariantViolation as exc:
+            caught = exc
+            break
+    assert caught is not None, "weakened quorum was never detected"
+    assert "seed=" in str(caught)
+\end{lstlisting}
+
+The same instinct produces \code{test\_same\_seed\_same\_run}, which runs a seed
+twice and compares a full fingerprint (messages sent, ops completed, and the
+complete tuple of every operation's client, key, kind, invoke time, complete
+time, and result). Determinism is not assumed; it is asserted, structurally,
+every test run.
+
+\subsection{The batch runner}
+
+\file{sim/batch.py} maps seeds across a \code{multiprocessing.Pool}. This is a
+legitimate use of parallelism that does not compromise determinism, because
+each seed is an independent pure function: process 3 running seed 1337 gets
+byte-identical results to a single-threaded run of seed 1337. Parallelism
+changes the wall-clock cost and nothing else. Failures print with their seed
+immediately (\code{flush=True}) and are re-listed at the end.
+
+% =====================================================================
+\section{The linearizability checker}
+
+This is written from scratch and is, algorithmically, the most demanding code
+in the repository.
+
+\subsection{What it is given}
+
+A \emph{history}: a list of \code{Op} records, each with an invoke time and
+either a completion time plus the observed result, or \code{math.inf} for
+completion, meaning the client never heard back.
+
+\begin{keyidea}{Incomplete operations are the interesting ones}
+If a client's request times out, the operation might have been applied, or
+might not have. \emph{Nobody knows, including the database.} A checker that
+ignored them would miss real bugs; a checker that assumed they happened would
+report false violations. The only correct treatment is to let the search branch
+both ways: an incomplete op may be linearized (with any result accepted, since
+none was observed) or left out entirely.
+\end{keyidea}
+
+\subsection{The algorithm}
+
+\begin{jargon}{Wing \& Gong search, with Lowe's memoization}
+The classical decision procedure. Repeatedly pick some operation that is
+\emph{minimal} (no un-linearized operation completed before it was invoked, so
+real-time order permits it to go next), apply it to a model of a single
+register, and check the model reproduces the result the client actually saw. If
+yes, recurse; if the branch dies, backtrack. Lowe's contribution is to memoize
+visited states so the same (set of linearized ops, register value) pair is never
+explored twice, which turns a factorial blowup into something that usually
+finishes.
+\end{jargon}
+
+\begin{keyidea}{The two decompositions that make this tractable at all}
+\textbf{One: per key.} KV keys are independent registers, and no operation in
+this system touches two keys, so a history is linearizable if and only if each
+key's sub-history is. \code{check\_history} splits by key and checks each
+separately. This turns one giant exponential problem into several small ones,
+and the README correctly calls it the largest practical win.
+
+\textbf{Two: the bitmask.} The set of already-linearized operations is
+represented as an integer where bit \code{i} means ``op \code{i} is done''.
+Set membership, insertion, and the memo key all become single machine
+instructions on an integer. This is why the checker's limit is \textbf{63
+operations per key}: a Python int is arbitrary precision, but the code
+deliberately caps it, and returns \code{UNKNOWN} above that rather than
+attempting a search that cannot finish.
+\end{keyidea}
+
+\begin{lstlisting}[language=Python, caption={checker/linearizability.py: the search loop, in full}]
+seen: set[tuple[int, str | None]] = set()
+explored = 0
+# Depth-first search over (linearized-mask, register value).
+stack: list[tuple[int, str | None]] = [(0, _ABSENT)]
+seen.add((0, _ABSENT))
+while stack:
+    mask, value = stack.pop()
+    if mask & complete_mask == complete_mask:
+        # Every completed op linearized; leftovers are incomplete ops
+        # we are free to declare "never happened".
+        return CheckResult(Outcome.OK, key, explored)
+    # An op is minimal if no un-linearized op completed before its invoke.
+    min_complete = math.inf
+    for i, op in enumerate(ops):
+        if not mask & (1 << i):
+            min_complete = min(min_complete, op.complete)
+    for i, op in enumerate(ops):
+        bit = 1 << i
+        if mask & bit or op.invoke > min_complete:
+            continue
+        matches, new_value = _step(value, op)
+        if not matches:
+            continue
+        state = (mask | bit, new_value)
+        if state not in seen:
+            seen.add(state)
+            explored += 1
+            if explored > max_states:
+                return CheckResult(Outcome.UNKNOWN, key, explored,
+                                   "state budget exhausted")
+            stack.append(state)
+return CheckResult(Outcome.VIOLATION, key, explored, ...)
+\end{lstlisting}
+
+Reading that loop carefully repays the effort:
+
+\begin{itemize}
+\item The success condition is \code{mask \& complete\_mask == complete\_mask},
+      not \code{mask == all ones}. It requires every \emph{completed} op to be
+      linearized, and lets any leftover incomplete ops be declared to have
+      never happened. That is the ``branch both ways'' semantics, implemented
+      not as a branch but as a weaker acceptance test, which is neater and
+      cheaper.
+\item \code{min\_complete} is the earliest completion among
+      \emph{un-linearized} ops. An op is a legal next choice if it was invoked
+      at or before that time. This is exactly the real-time-order constraint.
+\item Falling out of the \code{while} loop means the search space was exhausted
+      with no explanation found, and \emph{that} is a violation: not a timeout,
+      a proof.
+\end{itemize}
+
+\begin{keyidea}{Three outcomes, never two}
+\code{OK}, \code{VIOLATION}, and \code{UNKNOWN}. The third is the honest one.
+Linearizability checking is NP-complete in general, so any checker must
+eventually refuse. This one refuses in two explicit places (more than 63 ops on
+a key; more than \code{max\_states} states explored, default 2,000,000) and
+returns \code{UNKNOWN}, which is never reported as a pass and never as a fail.
+The design property that matters: \textbf{the checker never returns a false
+PASS or a false FAIL}, only sometimes a shrug.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.95\textwidth}{!}{
+\begin{tikzpicture}[node distance=9mm]
+\tikzset{st/.style={draw=inkblue, fill=softgrey, rounded corners=2pt, font=\scriptsize, inner sep=3pt, align=center}}
+\tikzset{dead/.style={st, draw=warnred, fill=warnred!8, text=warnred}}
+\tikzset{good/.style={st, draw=okgreen, fill=okgreen!12, text=okgreen}}
+
+\node[st] (r) {mask=000\\value=absent};
+\node[st, below left=11mm and 22mm of r] (a) {mask=001\\value="a"\\\scriptsize{}put a};
+\node[dead, below=11mm of r] (b) {mask=010\\get$\rightarrow$"a"\\but value is absent:\\\textbf{prune}};
+\node[st, below right=11mm and 22mm of r] (c) {mask=100\\value="b"\\\scriptsize{}put b};
+
+\draw[flow] (r) -- node[lbl, above, sloped]{op0: put "a"} (a);
+\draw[flow, draw=warnred] (r) -- node[lbl, right]{op1: get $\rightarrow$ "a"} (b);
+\draw[flow] (r) -- node[lbl, above, sloped]{op2: put "b"} (c);
+
+\node[good, below=11mm of a] (a2) {mask=011\\value="a"};
+\node[dead, below right=11mm and 2mm of a] (a3) {mask=101\\value="b"\\\scriptsize{}memoized: seen};
+\draw[flow, draw=okgreen] (a) -- node[lbl, left]{op1: get $\rightarrow$ "a"\\model agrees} (a2);
+\draw[flow, draw=warnred] (a) -- node[lbl, right, pos=0.7]{op2} (a3);
+\node[good, below=9mm of a2] (a4) {mask=111\\\textbf{all completed ops}\\\textbf{linearized: OK}};
+\draw[flow, draw=okgreen] (a2) -- (a4);
+
+\node[lbl, anchor=west, align=left, text width=5.4cm] at (4.6,-3.4)
+  {Each node is a memo key: (mask, value).\\
+   Pruned when the model contradicts the\\
+   observed result, or when the state was\\
+   already visited by another path.\\
+   Exhausting the tree with no OK leaf\\
+   is a \textbf{proof} of violation, not a timeout.};
+\end{tikzpicture}}
+\caption{The search, on a three-operation history. Branches die either because
+the model cannot reproduce what the client saw, or because Lowe memoization has
+already visited that exact state. Both prunings are what keep the exponential
+in check.}
+\end{figure}
+
+\subsection{The checker's own tests}
+
+\code{test\_linearizability.py} is 11 tests, and the important ones are the
+ones that demand \emph{rejection}:
+
+\begin{description}[leftmargin=0pt, itemsep=4pt]
+\item[\code{test\_stale\_read\_is\_violation}]\hfill\\
+      a put completed strictly before a get began, yet the get missed it.
+\item[\code{test\_value\_from\_nowhere\_is\_violation}]\hfill\\
+      a get returned a value nobody ever wrote.
+\item[\code{test\_lost\_update\_is\_violation}]\hfill\\
+      two non-overlapping cas from the same expected value both succeeded.
+\item[\code{test\_known\_bad\_interleaving\_from\_paper\_shape}]\hfill\\
+      a read after a completed cas returned the pre-cas value.
+\end{description}
+
+\begin{keyidea}{The budget test that passed for the wrong reason: the best story in the repo}
+The README tells this on itself, and it deserves the space. The original test
+for ``does the budget cause UNKNOWN'' used a history of 40 incomplete
+concurrent puts. It passed. But it passed for a reason that had nothing to do
+with the budget: a history of purely \emph{incomplete} operations is trivially
+linearizable by declaring that none of them ever happened, so the search
+succeeded on its very first move and never explored anything. The test asserted
+the right outcome while exercising none of the mechanism.
+
+The fixed test buries a real violation (\code{get $\rightarrow$ "phantom"})
+under 20 \emph{completed}, fully concurrent puts, which forces the exhaustive
+search that the budget exists to bound. This is a precise instance of the
+general lesson that runs through the whole project: a test that passes tells
+you nothing until you know \emph{why} it passes.
+\end{keyidea}
+
+\begin{honest}{The checker validates get and cas results, but not put or delete}
+Look at \code{\_step}. For \code{"get"} and \code{"cas"} it compares the model's
+answer against \code{op.result}. For \code{"put"} it returns \code{(True,
+new\_value)} unconditionally, and for \code{"delete"} it returns \code{(True,
+\_ABSENT)} unconditionally. So the \code{existed} flag that \code{delete}
+returns is \textbf{never checked against the model}, and a database that
+reported \code{existed: False} for a delete of a present key would sail through.
+This is a defensible narrowing (put and delete have no interesting return
+value, and \code{existed} is arguably not part of the register abstraction) but
+it is unstated, and the honest framing is that the checker verifies the
+register semantics of get and cas, and treats put and delete as pure state
+transitions.
+\end{honest}
+
+\begin{honest}{The chaos runs never exercise delete at all}
+\code{SimClient.\_next\_op} rolls: below 0.4, get; below 0.75, put; otherwise
+cas. There is no branch that issues a \code{delete}. So the headline sweep,
+however many seeds it runs, tests \code{delete} exactly zero times end to end.
+\code{delete} is covered by \code{test\_basic\_ops} (a unit test on
+\code{KVMachine} alone) and by one line of the TCP integration test, and that
+is all. It is a small gap, and easy to close (one branch in the client), but a
+claim of the form ``564,170 operations verified'' should be read as ``get, put
+and cas operations''.
+\end{honest}
+
+% =====================================================================
+\section{Verification: what was actually run for this document}
+\label{sec:verified}
+
+The brief for this document required that the project's headline claims be
+\textbf{executed rather than repeated}. They were, on this machine, from a
+clean virtual environment (\code{python3.12 -m venv .venv} and
+\code{pip install -e ".[dev]"}), on Linux with Python 3.12.3, 8 CPU cores.
+
+\subsection{The test suite}
+
+\begin{lstlisting}[caption={Observed output: the full suite, including the slow 200-seed sweep}]
+$ .venv/bin/python -m pytest
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/rolex/Salman Adnan/Programming/Portfolio/raft-kv
+configfile: pyproject.toml
+testpaths: tests
+collected 57 items
+
+tests/test_election.py .....                                             [  8%]
+tests/test_kv_sessions.py ....                                           [ 15%]
+tests/test_linearizability.py ...........                                [ 35%]
+tests/test_membership.py .....                                           [ 43%]
+tests/test_persistence.py .......                                        [ 56%]
+tests/test_readindex.py ....                                             [ 63%]
+tests/test_replication.py .........                                      [ 78%]
+tests/test_sim_invariants.py ......                                      [ 89%]
+tests/test_snapshot.py ...                                               [ 94%]
+tests/test_tcp_integration.py ...                                        [100%]
+
+============================= 57 passed in 51.41s ==============================
+\end{lstlisting}
+
+\textbf{Verified.} 57 tests, all passing, including the three real-TCP
+integration tests that bind localhost sockets and the 200-seed slow sweep. The
+README's claim of ``57 tests, all passing'' is exact.
+
+\subsection{The headline sweep}
+
+\begin{lstlisting}[caption={Observed output: the 5000-seed sweep, run for this document}]
+$ .venv/bin/raftkv sim --seeds 5000 --workers 8
+... 250/5000 seeds (13s)
+... 500/5000 seeds (27s)
+... (elided: one progress line per 250 seeds)
+... 4750/5000 seeds (243s)
+... 5000/5000 seeds (257s)
+5000 seeds in 257.0s (19.5 seeds/s), 564170 client ops total, 0 failure(s)
+\end{lstlisting}
+
+\begin{keyidea}{The op count reproduced exactly, and that is the real result}
+The README reports \code{564170 client ops total} from a run with
+\code{--workers 10}. This machine ran it with \code{--workers 8}. The op count
+came back \textbf{identical to the digit}. That is not a coincidence and it is
+not a weak check: it is the determinism claim being confirmed end to end. If any
+part of the system had consulted a wall clock, a hash seed, a set iteration
+order, or the global \code{random} module, running the same 5000 seeds on a
+different day with a different worker count would have produced a different
+number. It did not. The timing legitimately differs (fewer workers, different
+machine, different load), and timing is the one thing that is allowed to
+differ, because it is the only thing outside the seed.
+\end{keyidea}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Claim (README)} & \textbf{Observed here} & \textbf{Verdict} \\
+\midrule
+57 tests, all passing & 57 passed in 51.41s & confirmed \\
+5000 seeds & 5000 seeds & confirmed \\
+564170 client ops total & see above & confirmed, exactly \\
+0 failures & 0 failure(s) & confirmed \\
+84.7s / 59.0 seeds/s at \code{--workers 10} & 257.0s / 19.5 seeds/s at \code{--workers 8} & differs, see below \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{honest}{The one number that did not reproduce is the timing, and the gap is bigger than the worker count explains}
+The README reports 84.7 seconds (59.0 seeds/s) with \code{--workers 10}. This
+run took 257.0 seconds (19.5 seeds/s) with \code{--workers 8}. Dropping from 10
+workers to 8 accounts for at most a factor of 1.25; the observed gap is a factor
+of about 3.
+
+This is not a discrepancy in the code, and it is not evidence against anything:
+throughput is the one property of the sweep that is deliberately \emph{outside}
+the seed, and it depends on the core count, the CPU, and whatever else the
+machine was doing. \textbf{This particular run shared the machine with other
+substantial workloads}, which is the most likely explanation, but that is an
+\textbf{inference}: it was not isolated or measured, and the README's original
+run was not repeated under matched conditions. The honest position is that the
+timing figure in the README is a machine-and-day observation rather than a
+property of the project, and that the two figures that \emph{are} properties of
+the project, the op count and the failure count, both reproduced exactly.
+\end{honest}
+
+\subsection{What the numbers do and do not mean}
+
+\begin{honest}{Read the headline number carefully: it is impressive, and it is narrower than it sounds}
+``5,000 randomly generated disasters and 564,170 reads/writes with 0
+contradictions'' is true as stated and was reproduced here. Being precise about
+its scope is what makes it defensible under questioning:
+
+\begin{itemize}
+\item \textbf{5000 seeds is not 5000 independent disaster shapes.} Every seed
+      runs the same fixed recipe: 3 nodes, 12 virtual seconds, the same fault
+      probabilities. The seed varies the timing, the targets and the ordering,
+      not the shape of the experiment. It is a deep search of one scenario, not
+      a broad search across scenarios.
+\item \textbf{The 564,170 ops are get, put and cas.} No \code{delete} is ever
+      issued by the simulated client (see the honest box above).
+\item \textbf{The disks are perfect.} The simulator uses
+      \code{MemoryStorage}, which models an ideal fsync'd disk that never tears
+      a write and never reorders. The excellent torn-tail recovery code in
+      \code{FileStorage} is therefore \emph{never once exercised by any of the
+      5000 seeds}; it is covered only by targeted unit tests. The README lists
+      this under future work, and it is the single largest gap between what the
+      simulator tests and what production runs.
+\item \textbf{Membership changes are never exercised by the sweep either.} The
+      nemesis crashes, partitions and skews, but never adds or removes a server.
+\item \textbf{``0 contradictions'' means: no invariant violation fired, and no
+      history was refuted.} It does not mean every history was proven
+      linearizable, because a history that exceeded the checker's budget would
+      return \code{UNKNOWN}, and \code{SimResult.ok} treats \code{UNKNOWN} as
+      acceptable (\code{all(r.outcome is not Outcome.VIOLATION ...)}). No
+      \code{UNKNOWN} count is reported by the batch runner, so the sweep cannot
+      distinguish ``5000 proofs'' from ``4990 proofs and 10 shrugs''. Given the
+      configured width (3 keys, 3 clients, bounded concurrency) the histories
+      almost certainly fit well inside the budget, and the README says so, but
+      the runner does not \emph{show} that, and it easily could.
+\end{itemize}
+\end{honest}
+
+That last point is the one worth volunteering in an interview before anyone
+finds it, because volunteering it demonstrates exactly the discipline the whole
+project is arguing for.
+
+% =====================================================================
+\section{The outer layers: server, client, CLI}
+
+\subsection{RaftServer}
+
+\file{server.py} glues \code{FileStorage} + \code{KVMachine} + \code{RaftNode} +
+\code{TcpTransport} into one node and translates client frames into Raft
+operations. The interesting mechanism is how a client request waits for its own
+entry to commit: \code{\_register(index, term)} creates an
+\code{asyncio.Future}, stores it under the key \code{(index, term)}, and awaits
+it with a 5-second timeout. The apply listener resolves it.
+
+\begin{lstlisting}[language=Python, caption={server.py: resolve the waiter for this entry, and fail any waiter whose slot was stolen}]
+def _on_apply(self, index: int, term: int, entry: Entry, result: Any) -> None:
+    fut = self._pending.pop((index, term), None)
+    if fut is not None and not fut.done():
+        fut.set_result(result)
+    for key in [k for k in self._pending if k[0] == index and k[1] != term]:
+        stale = self._pending.pop(key)
+        if not stale.done():
+            stale.set_result(None)
+\end{lstlisting}
+
+Keying by \code{(index, term)} rather than \code{index} alone is the whole
+point. If this node's leadership was interrupted and a different leader put a
+\emph{different} entry at index 42, then the waiter for \code{(42, term 5)} must
+not be resolved by the arrival of \code{(42, term 6)}: its entry was silently
+overwritten and its client must be told the write did not happen. That is what
+the second half of the function does. \code{\_on\_step\_down} does the same,
+wholesale, on losing leadership. \code{SimCluster} carries the same logic in
+\code{\_make\_apply\_listener}, deliberately mirrored so the simulator's client
+sees the same failure semantics as a real one.
+
+\begin{honest}{One asymmetry between the two mirrored implementations}
+\code{server.py::\_on\_apply} guards every resolution with
+\code{if not fut.done()}. \code{harness.py::\_make\_apply\_listener} calls
+\code{host.pending.pop((i, t))(None)} with no equivalent guard, because its
+callbacks are plain functions rather than futures and are made idempotent by a
+\code{responded} flag inside \code{SimClient.\_attempt} instead. The two are
+each correct in context, but the invariant ``a client callback fires at most
+once'' is enforced in a different place in each, which is exactly the sort of
+divergence that rots.
+\end{honest}
+
+\subsection{RaftClient}
+
+Retries with leader hints. The loop is worth one note: on a \code{not\_leader}
+reply, it adopts the hint, but \code{self.\_leader\_hint = hint if hint !=
+target else None} guards against a node that names \emph{itself} as leader while
+rejecting the request, which would otherwise spin. Writes carry
+\code{seq=next(self.\_seq)} from an \code{itertools.count(1)}, which is the
+monotonic-counter lesson from the dedup incident encoded permanently into the
+library.
+
+\begin{honest}{A connection per request, and a session row per CLI invocation}
+\code{\_call\_node} opens a fresh TCP connection, sends one frame, reads one
+reply, and closes. The README lists persistent connections with request
+multiplexing as unfinished work, and notes the frame protocol was designed for
+it (frames carry an \code{id} field which is currently only used to assert the
+reply matches). Compounding it: the CLI builds a new \code{RaftClient} per
+command, and \code{RaftClient} defaults to a fresh random \code{cli-<uuid>}, so
+every \code{raftkv put} both opens a new connection and permanently grows the
+replicated session table by one row. For a demo this is invisible. It is worth
+saying out loud that the CLI is a demonstration surface, not a client library.
+\end{honest}
+
+\subsection{The CLI}
+
+\code{raftkv cluster start -n 3} spawns one real OS process per node with
+\code{start\_new\_session=True}, records pids in \code{cluster.json}, and then
+polls until a leader exists so that the command does not return a cluster that
+is not yet usable. This matters for the demo's credibility: because nodes are
+real processes, \code{demo.sh}'s \code{kill -9} on the leader pid is a genuine
+uncatchable process kill, not a polite in-process shutdown. \code{SIGKILL}
+cannot be trapped, so no cleanup handler runs, no buffers are flushed, and
+recovery must work purely from what \code{fsync} had already put on disk.
+
+% =====================================================================
+\section{Consolidated honest assessment}
+
+Everything below is drawn from reading the code, not from the README, though
+several items appear in the README's own ``honest limits'' section, which is
+itself unusually candid.
+
+\subsection{What is genuinely strong}
+
+\begin{itemize}
+\item \textbf{The sans-IO boundary is real, not aspirational.} \file{raft/} imports
+      \code{enum} and \code{typing} and its own siblings, and nothing else. No
+      \code{asyncio}, no \code{time}, no \code{socket}, no global
+      \code{random}. The architecture's central claim survives a grep.
+\item \textbf{The subtle rules are all present and correctly implemented}: vote
+      persistence before reply, the up-to-date check as a tuple comparison, the
+      section 5.4.2 own-term commit restriction with the no-op, the conflict
+      hint that can only move \code{next\_index} downward, the directory fsync
+      after rename, config effective on append, the leader that defers its own
+      removal until commit.
+\item \textbf{The tests test the tests.} The weakened-quorum canary, the
+      known-bad histories, and the determinism fingerprint are three
+      independent instances of the same discipline, and it is rare.
+\item \textbf{The honesty is load-bearing.} The \code{UNKNOWN} outcome, the
+      documented rejection of leader leases with reasons, and the README's own
+      list of limits are the work of someone optimizing for being right rather
+      than for looking right.
+\end{itemize}
+
+\subsection{Weaknesses, ranked by what would hurt most in an interview}
+
+\begin{enumerate}
+\item \textbf{The simulator's disk is perfect, so the crash-recovery code is
+      the least-tested important code in the project.} \code{MemoryStorage}
+      never tears a write, never reorders an fsync, never fails. The CRC
+      scan-and-truncate logic is genuinely good and is exercised only by
+      hand-built unit tests that write corrupt bytes directly. The project's
+      thesis is ``search the schedule space for bugs''; storage faults are
+      simply outside the searched space. The README names this. It is the
+      answer to ``what would you do next'', and it should be volunteered.
+\item \textbf{\code{UNKNOWN} is invisible.} \code{SimResult.ok} accepts it and
+      \code{batch.py} never counts it, so the sweep's headline cannot
+      distinguish a proof from a shrug. The fix is a few lines and would make
+      the headline number strictly stronger.
+\item \textbf{Replication is quadratic in the worst case.} Every heartbeat to a
+      lagging follower re-sends \code{tuple(self.log.slice\_from(ni))}, the
+      \emph{entire} remaining suffix, because \code{next\_index} only advances
+      on a reply. With a 30 ms heartbeat and a follower 10,000 entries behind,
+      that is the whole 10,000-entry suffix serialized to JSON every 30 ms
+      until the first reply lands. It is correct, because AppendEntries is
+      idempotent, and the README calls it naive and wasteful, which is fair.
+      There is no batch-size cap.
+\item \textbf{\code{\_load\_snapshot()} re-reads and re-parses the entire
+      persistent state, log included, on every InstallSnapshot send.}
+      See the honest box in the snapshot section.
+\item \textbf{No pre-vote.} A node returning from a partition has inflated its
+      term by campaigning fruitlessly, so on rejoining it forces a real leader
+      to step down and the cluster to hold a pointless election. Raft's
+      pre-vote extension fixes this; the README lists it, and correctly notes
+      that the simulator would verify the fix in minutes.
+\item \textbf{Sessions never expire}, and the table is inside the replicated
+      state and every snapshot.
+\item \textbf{Scale.} Python, JSON on the wire, one fsync per append batch, one
+      connection per client request. This is a correctness project. Its own
+      README says so in its first honest limit, which is the right call: an
+      inflated throughput claim would be the easiest thing in the world to
+      puncture.
+\end{enumerate}
+
+\subsection{Small things a careful reader will find}
+
+\begin{itemize}
+\item The \code{next\_index} initialization disagrees with itself across
+      \code{\_become\_leader}, \code{\_change\_config}, and
+      \code{\_refresh\_config} (off by one in the middle one; self-correcting).
+\item \code{\_config\_from}'s index filter is effectively vacuous at both call
+      sites.
+\item \code{Op.args} is typed \code{dict[str, Any]} and \code{Op.result} is
+      \code{Any}. The checker's \code{\_step} indexes the \code{value} and
+      \code{expected} keys of \code{op.args} with no validation, so a
+      malformed history raises \code{KeyError} rather than reporting a bad
+      input.
+\item \code{RaftLog.compact\_to} silently returns when
+      \code{index <= snapshot\_index}, which is the right behaviour for an
+      idempotent call but hides a genuine ordering error if one ever occurs.
+\item \code{cmd\_cluster\_start} returns exit code 1 with a warning if no leader
+      appears within 15 seconds, but leaves the spawned processes running. A
+      failed start is not cleaned up.
+\item \code{MAX\_FRAME} is 64 MB and \code{read\_frame} returns \code{None}
+      (silently closing the connection) rather than logging when a frame
+      exceeds it. Given uncapped, unchunked snapshots, this is the exact place
+      a too-large snapshot would fail, and it would fail quietly.
+\end{itemize}
+
+% =====================================================================
+\section{What to take away}
+
+\begin{keyidea}{The five sentences that summarize the project}
+\textbf{One.} Consensus reduces to keeping an ordered log identical across
+machines, and Raft keeps it identical by electing one leader per term who alone
+appends, and by requiring a majority for every decision, so that the overlap
+between any two majorities makes contradiction impossible.
+
+\textbf{Two.} The single architectural decision everything else rests on is
+sans-IO: \code{RaftNode} touches the world only through the \code{Env} and
+\code{Storage} protocols, so the identical consensus code runs over real TCP and
+inside a simulator, and every simulator bug is by construction a production bug.
+
+\textbf{Three.} Because every source of nondeterminism is funnelled through one
+seeded generator and one ordered event heap, a 12-second cluster lifetime under
+sustained chaos is a pure function of one integer, which makes thousands of
+disaster schedules searchable in seconds and makes any failure reproducible
+forever.
+
+\textbf{Four.} Correctness is judged from the outside, by a from-scratch
+linearizability checker that either proves a history explainable by a single
+honest register, refutes it, or honestly says \code{UNKNOWN}, never guessing.
+
+\textbf{Five.} The safety nets are themselves tested (weaken the quorum rule and
+the harness must notice; feed the checker known-bad histories and it must
+reject them), because a net that never fires is indistinguishable from one that
+cannot.
+\end{keyidea}
+
+\subsection{The questions this project invites, and the honest answers}
+
+\begin{center}
+\begin{tabular}{p{5.6cm}p{8.6cm}}
+\toprule
+\textbf{Question} & \textbf{Honest answer} \\
+\midrule
+Why not use an existing Raft library? & The point was to understand where the subtlety lives. Section 5.4.2 and the ReadIndex term-commit precondition are two places a plausible shortcut is a real bug, and the chaos harness found the second one during development. \\
+Is 5000 seeds meaningful? & It is a deep search of one fixed scenario (3 nodes, 12s, fixed fault rates), not a broad one. It reproduced to the digit on a different worker count, which is the determinism claim confirmed. \\
+What is not tested? & Storage faults (the simulator's disk is perfect), \code{delete} end to end, membership changes under chaos, and anything above single-digit node counts. \\
+What would you do first? & Inject torn writes and fsync reordering into simulated storage, so the 5000 seeds cover the recovery paths that are currently only unit-tested. Then report \code{UNKNOWN} counts in the sweep. \\
+Why ReadIndex and not leases? & Leases trade a round trip for an assumption about bounded clock drift between machines. In a project whose thesis is testable correctness, an untestable hardware assumption is a bad trade. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vfill
+\begin{center}
+\small\itshape
+Every claim in section~\ref{sec:verified} was produced by executing the code on
+this machine, not by quoting the README. Everything labelled inferred is
+labelled inferred. Where the code and the documentation disagreed, the code was
+taken as the source of truth.
+\end{center}
+
+\end{document}
